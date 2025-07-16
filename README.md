@@ -17,3 +17,11 @@ direct
 Now, you can interact with the UART shell! Try out some of the following commands:
 `help`
 `read lsm6ds`
+
+## Guide: storing periodic sensor readings to onboard storage
+All sensor readings can be stored onto the board's flash storage!
+Use the command sensor_timer_start `<sensor_name> <file_name> <timing>` to begin reading from a sensor (specified by `sensor_name`) to a file (specified by `file_name`) every `timing` seconds.
+
+This continues indefinitely until you use `sensor_timer_stop <sensor_name>` to stop the sensor readings from being saved.
+
+Note that in order to read the sensor data, you must use the `cat` command alongside the directory your file is stored in, which is the `/lfs/` directory. Ex: `cat /lfs/sensordata.txt`
