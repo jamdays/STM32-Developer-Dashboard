@@ -30,6 +30,12 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/kernel.h>
 
+#include "wifi.h"
+#include "wifi.c"
+
+#include "filesys.h"
+#include "filesys.c"
+
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 #define NUM_SENSORS 6
@@ -84,15 +90,7 @@ static struct fs_mount_t littlefs_mnt = {
     .mnt_point = "/lfs"
 };
 
-// Wifi
-#define WIFI_CONFIG_FILE "/lfs/wifi.conf"
-static struct net_if *iface;
-static struct wifi_connect_req_params wifi_params;
-static struct net_mgmt_event_callback wifi_cb;
-volatile char *ssid = NULL;
-volatile char *password = NULL;
 
-volatile bool wifi_is_ready = false;
 
 // Sensor Info
 
@@ -308,34 +306,6 @@ void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t
 }
 #endif
 
-// Connect Wifi passing ssid and password (todo add key)
-static int cmd_wifi_connect(const struct shell *shell, size_t argc, char **argv)
-{
-    if (argc < 3) {
-        shell_error(shell, "Usage: wifi_connect <ssid> <password>");
-        return -EINVAL;
-    }
-    wifi_params.ssid = (const uint8_t *)argv[1];
-    wifi_params.ssid_length = strlen(argv[1]);
-    wifi_params.psk = (const uint8_t *)argv[2];
-    wifi_params.psk_length = strlen(argv[2]);
-    wifi_params.security = WIFI_SECURITY_TYPE_PSK;
-    wifi_params.channel = WIFI_CHANNEL_ANY;
-
-    iface = net_if_get_default();
-    if (!iface) {
-        shell_error(shell, "Could not get default network interface");
-        return -ENODEV;
-    }
-
-    int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params, sizeof(struct wifi_connect_req_params));
-    if (ret) {
-        shell_error(shell, "Failed to connect to WiFi: %d", ret);
-    } else {
-        shell_print(shell, "Connecting to WiFi...");
-    }
-    return ret;
-}
 
 #ifdef CONFIG_HTTP_SERVER
 void http_server_thread_orig(void)
@@ -400,111 +370,7 @@ static void cmd_toggle_led1 (const struct shell *shell, size_t argc, char **argv
     }
 }
 
-// Print contents of root dir (/lfs) to Shell
-static int cmd_ls (const struct shell *shell, size_t argc, char **argv) {
-    int rc;
-    struct fs_dir_t dir = {}; 
-    static struct fs_dirent entry;
 
-
-    rc = fs_opendir(&dir, "/lfs");
-    if (rc < 0) {
-        shell_error(shell, "Failed to open directory \"/\": %d", rc);
-        return rc;
-    }
-
-    while(1) {
-        rc = fs_readdir(&dir, &entry);
-        if (rc < 0) {
-            shell_error(shell, "Failed to read directory \"/\": %d", rc);
-            fs_closedir(&dir);
-            return rc;
-        } else if (rc == 0 && entry.name[0] == '\0') {
-            break; // No more entries
-        } else if (rc == 0) {
-            shell_print(shell, "%s", entry.name);
-        } else {
-            shell_print(shell, "Unexpected return value from fs_readdir: %d", rc);
-            break;
-        }
-    }
-    fs_closedir(&dir);
-}
-
-// Print contents of a file to Shell
-static int cmd_cat(const struct shell *shell, size_t argc, char **argv)
-{
-    struct fs_file_t file;
-    fs_file_t_init(&file);
-    int rc;
-    char * filepath = argv[1];
-
-    rc = fs_open(&file, filepath, FS_O_READ);
-    if (rc == -ENOENT) {
-        shell_print(shell, "File doesn't exist: %s", filepath);
-        return 0;
-    } else if (rc < 0) {
-        shell_error(shell, "Failed to open file %s: %d", filepath, rc);
-        return rc;
-    } else {
-        shell_print(shell, "Contents of %s:", filepath);
-        char buf[64];
-        while(1) { // reading 64 bytes at a time for now. maybe bigger later
-            int got = fs_read(&file, buf, sizeof(buf) - 1);
-            if (got < 0) { //error
-                shell_error(shell, "Failed to read file %s: %d", filepath, got);
-                fs_close(&file);
-                return got;
-            } else if (got == 0) {
-                break;
-            } 
-            buf[got] = '\0'; // null-terminate the string
-            //shell_print(shell, "%s", buf); 
-            shell_fprintf(shell, SHELL_NORMAL, "%s", buf);
-        }
-        fs_close(&file);
-        return 0;
-    }
-}
-
-void cmd_rm(const struct shell *shell, size_t argc, char **argv) {
-    if (argc < 2) {
-        shell_error(shell, "Usage: rm <file_name>");
-        return;
-    }
-    const char *file_name = argv[1];
-    int rc = fs_unlink(file_name);
-    if (rc < 0) {
-        shell_error(shell, "Failed to remove file %s: %d", file_name, rc);
-    } else {
-        shell_print(shell, "File %s removed successfully", file_name);
-    }
-}
-
-static void cmd_wifi_save (const struct shell *shell, size_t argc, char **argv){
-    struct fs_file_t file;
-    fs_file_t_init(&file);
-    int rc = fs_open(&file, WIFI_CONFIG_FILE, FS_O_CREATE | FS_O_WRITE);
-    if (rc < 0) {
-        printk("Failed to open WiFi config file: %d\n", rc);
-        return;
-    }
-
-    if (argc == 3) {
-        fs_write(&file, argv[1], strlen(argv[1]));
-        fs_write(&file, "\n", 1);
-        fs_write(&file, argv[2], strlen(argv[2]));
-        fs_write(&file, "\n", 1);
-        printk("WiFi credentials saved to %s\n", WIFI_CONFIG_FILE);
-    } else {
-        printk("No WiFi credentials to save.\n");
-    }
-    fs_close(&file);
-}
-
-static void cmd_wifi_reconnect(const struct shell *shell, size_t argc, char **argv) {
-    wifi_connect_to_saved_network();
-}
 
 struct sensor_save_work {
     struct k_work work;
@@ -963,15 +829,9 @@ static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv)
 }
 
 SHELL_CMD_REGISTER(read, NULL, "Read sensor data", cmd_read_sensor);
-SHELL_CMD_REGISTER(wifi_connect, NULL, "Connect to WiFi", cmd_wifi_connect);
 SHELL_CMD_REGISTER(toggle_led1, NULL, "Toggle LED1", cmd_toggle_led1);
 
-SHELL_CMD_REGISTER(ls, NULL, "List items on FS", cmd_ls);
-SHELL_CMD_REGISTER(cat, NULL, "Display contents of a file", cmd_cat);
-SHELL_CMD_REGISTER(rm, NULL, "Remove a file", cmd_rm);
 
-SHELL_CMD_REGISTER(wifi_save, NULL, "Save WiFi credentials to file", cmd_wifi_save);
-SHELL_CMD_REGISTER(wifi_reconnect, NULL, "Reconnect to saved WiFi network", cmd_wifi_reconnect);
 
 SHELL_CMD_REGISTER(sensor_timer_start, NULL, "Start sensor timer", cmd_sensor_timer_start);
 SHELL_CMD_REGISTER(sensor_timer_stop, NULL, "Stop sensor timer", cmd_sensor_timer_stop);
@@ -985,95 +845,6 @@ SHELL_CMD_REGISTER(sensor_timer_http_stop, NULL, "Stop sensor HTTP timer", cmd_s
 //K_THREAD_DEFINE(scheduler, 2048, scheduler_thread, NULL, NULL, NULL, 7, 0, 0);
 
 // Handle DHCP assigning IP (set state variable)
-static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb, uint32_t mgmt_event, struct net_if *iface)
-{
-    if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
-        char buf[NET_IPV4_ADDR_LEN];
-        wifi_is_ready = true; 
-        //printk("IPv4 address: %s\n", net_addr_ntop(AF_INET, &iface->config.ip.ipv4->unicast[0].address.in_addr, buf, sizeof(buf)));
-    }
-
-}
-
-void read_wifi_config() {
-    struct fs_file_t file;
-    fs_file_t_init(&file);
-    int rc = fs_open(&file, WIFI_CONFIG_FILE, FS_O_READ);
-    if (rc < 0) {
-        printk("Failed to open WiFi config file: %d\n", rc);
-        return;
-    }
-
-    char _ssid[128];
-    char _password[128];
-    
-    uint8_t _ssid_len;
-    uint8_t _password_len;
-
-    char buf[64];
-    char * b = &buf;
-    int len = 0;
-    bool next = false;
-    while ((len = fs_read(&file, b, 1)) > 0) {
-        if (*b == '\n') {
-            *b = '\0'; // Null-terminate the string
-            if (!next) {
-                _ssid_len = strlen(buf);
-                if (_ssid_len > 0) {
-                    strncpy(_ssid, buf, sizeof(_ssid) - 1);
-                    _ssid[_ssid_len] = '\0';
-                    next = true;
-                    b = &buf[0]; // Reset buffer pointer
-                    continue;
-                }
-            } else {
-                _password_len = strlen(buf);
-                if (_password_len > 0) {
-                    strncpy(_password, buf, sizeof(_password) - 1);
-                    _password[_password_len] = '\0';
-                }
-                break; 
-            }
-        }
-        b++;
-
-    }
-    ssid = k_malloc(_ssid_len + 1);
-    password = k_malloc(_password_len + 1);
-    strcpy(ssid, _ssid);
-    strcpy(password, _password);
-    fs_close(&file);
-    return; 
-}
-
-void wifi_connect_to_saved_network() {
-    read_wifi_config();
-    if (ssid && password) {
-        wifi_params.ssid = (const uint8_t *)ssid;
-        wifi_params.ssid_length = strlen(ssid);
-        wifi_params.psk = (const uint8_t *)password;
-        wifi_params.psk_length = strlen(password);
-        wifi_params.security = WIFI_SECURITY_TYPE_PSK;
-        wifi_params.channel = WIFI_CHANNEL_ANY;
-
-        iface = net_if_get_default();
-        if (!iface) {
-            //shell_error(shell, "Could not get default network interface");
-            return -ENODEV;
-        }
-
-        int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params, sizeof(struct wifi_connect_req_params));
-        if (ret) {
-            //shell_error(shell, "Failed to connect to WiFi: %d", ret);
-        } else {
-            //shell_print(shell, "Connecting to WiFi...");
-        }
-        return;
-        //return ret;
-    } else {
-        printk("No saved WiFi credentials found.\n");
-    }
-}
 
 void init_sensors() {
     for (int i = 0; i < NUM_SENSORS; i++) {

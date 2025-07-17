@@ -1,4 +1,7 @@
 #include "filesys.h"
+#include <zephyr/fs/fs.h>
+#include <zephyr/fs/littlefs.h>
+#include <zephyr/storage/flash_map.h>
 
 // Print contents of root dir (/lfs) to Shell
 static int cmd_ls (const struct shell *shell, size_t argc, char **argv) {
@@ -80,3 +83,7 @@ void cmd_rm(const struct shell *shell, size_t argc, char **argv) {
         shell_print(shell, "File %s removed successfully", file_name);
     }
 }
+
+SHELL_CMD_REGISTER(ls, NULL, "List items on FS", cmd_ls);
+SHELL_CMD_REGISTER(cat, NULL, "Display contents of a file", cmd_cat);
+SHELL_CMD_REGISTER(rm, NULL, "Remove a file", cmd_rm);
