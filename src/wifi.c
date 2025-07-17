@@ -1,10 +1,13 @@
 #include "wifi.h"
 #include <zephyr/net/wifi_mgmt.h>
-
-
 #include <zephyr/fs/fs.h>
 #include <zephyr/fs/littlefs.h>
 #include <zephyr/storage/flash_map.h>
+
+volatile char ssid[32] = {0};
+volatile char password[64] = {0};
+volatile bool wifi_is_ready = false;
+
 
 static int cmd_wifi_connect(const struct shell *shell, size_t argc, char **argv)
 {
@@ -60,14 +63,12 @@ static void cmd_wifi_reconnect(const struct shell *shell, size_t argc, char **ar
 }
 
 
-static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb, uint32_t mgmt_event, struct net_if *iface)
+void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb, uint32_t mgmt_event, struct net_if *iface)
 {
     if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
         char buf[NET_IPV4_ADDR_LEN];
         wifi_is_ready = true; 
-        //printk("IPv4 address: %s\n", net_addr_ntop(AF_INET, &iface->config.ip.ipv4->unicast[0].address.in_addr, buf, sizeof(buf)));
     }
-
 }
 
 void read_wifi_config() {
@@ -113,8 +114,6 @@ void read_wifi_config() {
         b++;
 
     }
-    ssid = k_malloc(_ssid_len + 1);
-    password = k_malloc(_password_len + 1);
     strcpy(ssid, _ssid);
     strcpy(password, _password);
     fs_close(&file);

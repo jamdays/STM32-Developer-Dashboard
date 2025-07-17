@@ -31,10 +31,7 @@
 #include <zephyr/kernel.h>
 
 #include "wifi.h"
-#include "wifi.c"
-
 #include "filesys.h"
-#include "filesys.c"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
