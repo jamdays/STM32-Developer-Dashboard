@@ -36,7 +36,6 @@
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 #define NUM_SENSORS 6
-#define SCHEDULE_FILE "/lfs/schedule.txt"
 
 // Sensor device nodes
 static const struct device *const hts221 = DEVICE_DT_GET_ANY(st_hts221);
@@ -86,223 +85,10 @@ static struct fs_mount_t littlefs_mnt = {
     .storage_dev = (void *)FIXED_PARTITION_ID(storage_partition),
     .mnt_point = "/lfs"
 };
-
-
-
 // Sensor Info
 
-// REST client
-#define MAX_CALLBACKS 5
-struct sensor_callback {
-    const char *sensor_name;
-    char url[128];
-};
-static struct sensor_callback callbacks[MAX_CALLBACKS];
-static int callback_count = 0;
-
-
-
-// Work queue for handling http interrupts
-#ifdef CONFIG_HTTP_CLIENT
-K_THREAD_STACK_DEFINE(http_work_q_stack, 2048);
-static struct k_work_q http_work_q;
-struct http_work {
-    struct k_work work;
-    char url[128];
-    char data[128];
-};
-#endif
-
-
-#ifdef CONFIG_HTTP_CLIENT
 static void http_client_work_handler(struct k_work *work);
-#endif
-
-// Forward declarations for shell commands
 static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv);
-
-static void http_response_cb(struct http_response *rsp, enum http_final_call final_data, void *user_data)
-{
-    if (final_data == HTTP_DATA_FINAL) {
-        printk("REST call finished with status: %s\n", rsp->http_status);
-    }
-}
-
-// Make HTTP Request
-#ifdef CONFIG_HTTP_CLIENT
-static void http_client_work_handler_old2(struct k_work *work)
-{
-    //struct http_work *http_work_item = CONTAINER_OF(http_work, struct http_work, http_work);
-    struct http_work *http_work_item;
-    struct http_request req;
-    static uint8_t recv_buf[512];
-    int sock;
-    struct addrinfo *res;
-    struct addrinfo hints = {
-        .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM,
-    };
-
-    // Basic URL parsing
-    char *host = http_work_item->url;
-    char *path = strchr(host, '/');
-    if (path) {
-        *path = 0;
-        path++;
-    } else {
-        path = "";
-    }
-
-    if (getaddrinfo(host, "80", &hints, &res) != 0) {
-        printk("Failed to resolve hostname: %s\n", host);
-        return;
-    }
-
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) {
-        printk("Failed to create socket\n");
-        freeaddrinfo(res);
-        return;
-    }
-
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        printk("Failed to connect to server\n");
-        close(sock);
-        freeaddrinfo(res);
-        return;
-    }
-
-    memset(&req, 0, sizeof(req));
-    req.method = HTTP_POST;
-    req.url = path;
-    req.host = host;
-    req.protocol = "HTTP/1.1";
-    req.payload = http_work_item->data;
-    req.payload_len = strlen(http_work_item->data);
-    const char *headers = "Content-Type: application/json\r\n";
-    req.header_fields = headers;
-    req.response = http_response_cb;
-    req.recv_buf = recv_buf;
-    req.recv_buf_len = sizeof(recv_buf);
-
-    if (http_client_req(sock, &req, 5000, NULL) < 0) {
-        printk("HTTP client request failed\n");
-    }
-
-    close(sock);
-    freeaddrinfo(res);
-}
-
-
-static void http_client_work_handler_old(struct k_work *work)
-{
-    printk("Executing HTTP client work\n");
-    struct http_work *http_work_item = CONTAINER_OF(work, struct http_work, work);
-    struct http_request req;
-    static uint8_t recv_buf[512];
-    int sock;
-    struct addrinfo *res;
-    struct addrinfo hints = {
-        .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM,
-    };
-
-    // Basic URL parsing
-    char *host = http_work_item->url;
-    char *path = strchr(host, '/');
-    if (path) {
-        *path = 0;
-        path++;
-    } else {
-        path = "";
-    }
-
-    if (getaddrinfo(host, "80", &hints, &res) != 0) {
-        printk("Failed to resolve hostname: %s\n", host);
-        return;
-    }
-
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) {
-        printk("Failed to create socket\n");
-        freeaddrinfo(res);
-        return;
-    }
-
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        printk("Failed to connect to server\n");
-        close(sock);
-        freeaddrinfo(res);
-        return;
-    }
-
-    memset(&req, 0, sizeof(req));
-    req.method = HTTP_POST;
-    req.url = path;
-    req.host = host;
-    req.protocol = "HTTP/1.1";
-    req.payload = http_work_item->data;
-    req.payload_len = strlen(http_work_item->data);
-    const char *headers = "Content-Type: application/json\r\n";
-    req.header_fields = headers;
-    req.response = http_response_cb;
-    req.recv_buf = recv_buf;
-    req.recv_buf_len = sizeof(recv_buf);
-
-    if (http_client_req(sock, &req, 5000, NULL) < 0) {
-        printk("HTTP client request failed\n");
-    }
-
-    close(sock);
-    freeaddrinfo(res);
-}
-#endif
-
-// HTTP Trigger Handler
-#ifdef CONFIG_HTTP_CLIENT
-static void trigger_handler(const struct device *dev, const struct sensor_trigger *trig)
-{
-    //printk("Sensor interrupt triggered for %s\n", dev->name);
-    for (int i = 0; i < callback_count; i++) {
-        if (strcmp(callbacks[i].sensor_name, dev->name) == 0) {
-            struct http_work *new_work = k_malloc(sizeof(struct http_work));
-            if (new_work) {
-                k_work_init(&new_work->work, http_client_work_handler);
-                strcpy(new_work->url, callbacks[i].url);
-                snprintf(new_work->data, sizeof(new_work->data), "{\"sensor\":\"%s\",\"value\":\"triggered\"}", dev->name);
-                k_work_submit_to_queue(&http_work_q, &new_work->work);
-            }
-        }
-    }
-    if (sensor_sample_fetch(dev) < 0) {
-        printk("Failed to fetch sensor sample for %s\n", dev->name);
-        return;
-    }
-
-    // Re-enable the trigger
-}
-#endif
-
-// Example Button Pressed HTTP Callback Event
-#ifdef CONFIG_HTTP_CLIENT
-void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    printk("Button pressed\n");
-    for (int i = 0; i < callback_count; i++) {
-        if (strcmp(callbacks[i].sensor_name, "BUTTON0") == 0) {
-            struct http_work *new_work = k_malloc(sizeof(struct http_work));
-            if (new_work) {
-                k_work_init(&new_work->work, http_client_work_handler);
-                strcpy(new_work->url, callbacks[i].url);
-                snprintf(new_work->data, sizeof(new_work->data), "{\"button\":\"pressed\"}");
-                k_work_submit_to_queue(&http_work_q, &new_work->work);
-            }
-            return;
-        }
-    }
-}
-#endif
-
 
 #ifdef CONFIG_HTTP_SERVER
 void http_server_thread_orig(void)
@@ -366,8 +152,6 @@ static void cmd_toggle_led1 (const struct shell *shell, size_t argc, char **argv
         shell_print(shell, "LED0 turned ON");
     }
 }
-
-
 
 struct sensor_save_work {
     struct k_work work;
@@ -472,9 +256,8 @@ struct sensor_info sensors[NUM_SENSORS] = {
 
     },
     {
-        // Button 0 as GPIO
         .dev_or_gpio = TYPE_GPIO,
-        .dev = NULL, // No device, just GPIO
+        .dev = NULL, 
         .gpio = &button0,
         .name = "button0",
         .timer_callback = sensor_timer_callback,
@@ -489,7 +272,7 @@ int get_sensor_index(char *sensor_name) {
             return i;
         }
     }
-    return -1; // Not found
+    return -1; 
 }
 
 void http_client_work_handler(struct k_work *work) {
@@ -534,29 +317,12 @@ void http_client_work_handler(struct k_work *work) {
     if (getaddrinfo(host, "80", &hints, &res) != 0) {
         printk("Failed to resolve hostname: %s\n", host);
         return;
-    }/**/
-/*
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) {
-        printk("Failed to create socket\n");
-        freeaddrinfo(res);
-        return;
     }
-
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        printk("Failed to connect to server\n");
-        close(sock);
-        freeaddrinfo(res);
-        return;
-    }*/
     
     struct sockaddr_in addr = {0};
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(80);
-    //inet_pton(AF_INET, "192.168.3.14", &addr.sin_addr);
-    
-    //inet_pton(AF_INET, host, &addr.sin_addr);
     addr.sin_addr = *((struct in_addr *)res->ai_addr->data + 2); // Copy the resolved address
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     connect(sock, (struct sockaddr *)&addr, sizeof(addr));
@@ -566,26 +332,11 @@ void http_client_work_handler(struct k_work *work) {
     write(sock, _buf, strlen(_buf));
     close(sock);
 
-    /*memset(&req, 0, sizeof(req));
-    req.method = HTTP_POST;
-    req.url = path;
-    req.host = host;
-    req.protocol = "HTTP/1.1";
-    req.payload = buf;
-    req.payload_len = strlen(buf);
-    static const char *headers = "Content-Type: application/json\r\n";
-    req.header_fields = headers;
-    req.response = http_response_cb;
-    req.recv_buf = recv_buf;
-    req.recv_buf_len = sizeof(recv_buf);
-
-
     if (http_client_req(sock, &req, 5000, NULL) < 0) {
         printk("HTTP client request failed\n");
     }
 
-    close(sock);*/
-    //freeaddrinfo(res);
+    close(sock);
 }
 
 void sensor_work_handler(struct k_work *work) {
@@ -613,16 +364,12 @@ void sensor_work_handler(struct k_work *work) {
     fs_file_t_init(&file);
     ret = fs_open(&file, full_path, FS_O_CREATE | FS_O_APPEND);
     if (ret < 0) {
-        printk("Failed to open file: %s\n", full_path);
         return;
     }
 
-    //fs_seek(&file, 0, FS_SEEK_END);
     ret = fs_write(&file, buf, len);
     if (ret < 0) {
-        printk("Failed to write to file: %d\n", ret);
     }
-
     printk("Writing to file %s->%s<-END\n", full_path, buf);
     fs_close(&file);
 }
@@ -795,7 +542,6 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
                         "Unknown sensor: %s\n", sensor_name);
     }
 
-    /* Enforce null termination and check for truncation */
     buf[buf_len - 1] = '\0';
     if (used >= (int)buf_len) {
         return -ENOSPC;
@@ -865,6 +611,16 @@ void init_sensors() {
         k_work_init(&sensors[i].http_work, http_client_work_handler);
         sensors[i].cb_filename = k_malloc(64);
         sensors[i].url = k_malloc(128);
+        struct sensor_value odr_attr;
+        odr_attr.val1 = 104; // Set ODR to 100 Hz
+        odr_attr.val2 = 0;
+
+        if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_ACCEL_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
+            printk("Failed to set LSM6DSL ODR\n");
+        }
+        if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
+            printk("Failed to set LSM6DSL Gyro ODR\n");
+        }
     }
 }
 
@@ -879,12 +635,6 @@ void main(void)
     gpio_pin_configure_dt(&button0, GPIO_INPUT);
     gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_TO_ACTIVE);
     
-    #ifdef CONFIG_HTTP_CLIENT
-    // Setup Button HTTP Callback for testing (disable later)
-    gpio_init_callback(&button_cb_data, button_pressed, BIT(button0.pin));
-    gpio_add_callback(button0.port, &button_cb_data);
-    #endif
-
     printk("LEDs and button initialized\n");
 
     // Initialize Filesystem
@@ -902,26 +652,10 @@ void main(void)
     printk("WiFi initialized\n");
     wifi_connect_to_saved_network();
 
-    // Initialize Work Queue
-    #ifdef CONFIG_HTTP_CLIENT
-    printk("Initializing work queue...\n");
-    k_work_queue_start(&http_work_q, http_work_q_stack, K_THREAD_STACK_SIZEOF(http_work_q_stack), K_PRIO_COOP(7), NULL);
-    printk("Work queue initialized\n");
-    #endif
-
     // Initialize Sensors and Triggers
     init_sensors();
 
-    struct sensor_value odr_attr;
-    odr_attr.val1 = 1; // Set ODR to 100 Hz
-    odr_attr.val2 = 0;
 
-    if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_ACCEL_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
-        printk("Failed to set LSM6DSL ODR\n");
-    }
-    if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
-        printk("Failed to set LSM6DSL Gyro ODR\n");
-    }
     
     printk("System Initialized. Entering main loop.\n");
 
