@@ -50,6 +50,17 @@ static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static struct gpio_callback button_cb_data;
 
+
+// Filesystem
+FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(cstorage);
+static struct fs_mount_t littlefs_mnt = {
+    .type = FS_LITTLEFS,
+    .fs_data = &cstorage,
+    .storage_dev = (void *)FIXED_PARTITION_ID(storage_partition),
+    .mnt_point = "/lfs"
+};
+
+// Sensor Info
 enum sensor_type {
     TYPE_DEV,
     TYPE_GPIO
@@ -61,6 +72,7 @@ struct axes_list {
 };
 
 struct sensor_info {
+
     bool dev_or_gpio;
     const struct device *dev;
     const struct gpio_dt_spec *gpio;
@@ -77,82 +89,6 @@ struct sensor_info {
     const char * url; // For HTTP client
 };
 
-// Filesystem
-FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(cstorage);
-static struct fs_mount_t littlefs_mnt = {
-    .type = FS_LITTLEFS,
-    .fs_data = &cstorage,
-    .storage_dev = (void *)FIXED_PARTITION_ID(storage_partition),
-    .mnt_point = "/lfs"
-};
-// Sensor Info
-
-static void http_client_work_handler(struct k_work *work);
-static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv);
-
-#ifdef CONFIG_HTTP_SERVER
-void http_server_thread_orig(void)
-{
-    printk("HTTP server thread started\n");
-    // Basic HTTP server implementation
-    while(1) {
-        k_msleep(1000); // Wait for init event
-        if (wifi_is_ready) {
-            break;
-        }
-    }
-
-    int serv_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(8081);
-    //addr.sin_addr.s_addr = inet_addr("192.168.3.35");
-    addr.sin_addr.s_addr = htonl(INADDR_ANY); // Listen on all interfaces
-
-    bind(serv_sock, (struct sockaddr *)&addr, sizeof(addr));
-    listen(serv_sock, 2);
-
-    while (1) {
-        int client_sock = accept(serv_sock, NULL, NULL);
-        if (client_sock < 0) {
-            k_sleep(K_SECONDS(1)); // Wait before retrying
-            continue;
-        }
-
-        char buf[256];
-        int len = recv(client_sock, buf, sizeof(buf) - 1, 0);
-        buf[len] = 0;
-
-        // Simple request parsing
-        if (strstr(buf, "GET /sensors/hts221")) {
-            struct sensor_value temp, hum;
-            sensor_sample_fetch(hts221);
-            sensor_channel_get(hts221, SENSOR_CHAN_AMBIENT_TEMP, &temp);
-            sensor_channel_get(hts221, SENSOR_CHAN_HUMIDITY, &hum);
-            snprintf(buf, sizeof(buf), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"temp\":%d.%06d, \"humidity\":%d.%06d}", temp.val1, temp.val2, hum.val1, hum.val2);
-        } else {
-            snprintf(buf, sizeof(buf), "HTTP/1.1 404 Not Found\r\n\r\n");
-        }
-
-        send(client_sock, buf, strlen(buf), 0);
-        close(client_sock);
-    }
-}
-#endif
-
-// Toggle LED 1
-static void cmd_toggle_led1 (const struct shell *shell, size_t argc, char **argv)
-{
-    if (gpio_pin_get_dt(&led1) > 0) {
-        gpio_pin_set_dt(&led1, 0);
-        shell_print(shell, "LED0 turned OFF");
-    } else {
-        gpio_pin_set_dt(&led1, 1);
-        shell_print(shell, "LED0 turned ON");
-    }
-}
-
 struct sensor_save_work {
     struct k_work work;
     char sensor_name[32]; // Sensor name
@@ -167,8 +103,6 @@ enum sensor_names {
     VL53L0X,
     BUTTON0
 };
-
-void sensor_timer_callback(struct k_timer *timer_id);
 
 static struct axes_list hts221_axes[] = {
     { .chan = SENSOR_CHAN_AMBIENT_TEMP, .name = "temperature" },
@@ -198,6 +132,13 @@ static struct axes_list vl53l0x_axes[] = {
     { .chan = SENSOR_CHAN_PROX, .name = "proximity" }
 };
 
+
+
+
+
+void sensor_timer_callback(struct k_timer *timer_id);
+
+// HTTP Client
 void sensor_timer_http_callback(struct k_timer *timer_id);
 
 struct sensor_info sensors[NUM_SENSORS] = {
@@ -275,6 +216,76 @@ int get_sensor_index(char *sensor_name) {
     return -1; 
 }
 
+static void http_client_work_handler(struct k_work *work);
+
+// Sensor Reading command
+static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv);
+
+// EXPERIMENTAL
+#ifdef CONFIG_HTTP_SERVER
+void http_server_thread_orig(void)
+{
+    printk("HTTP server thread started\n");
+    // Basic HTTP server implementation
+    while(1) {
+        k_msleep(1000); // Wait for init event
+        if (wifi_is_ready) {
+            break;
+        }
+    }
+
+    int serv_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(8081);
+    //addr.sin_addr.s_addr = inet_addr("192.168.3.35");
+    addr.sin_addr.s_addr = htonl(INADDR_ANY); // Listen on all interfaces
+
+    bind(serv_sock, (struct sockaddr *)&addr, sizeof(addr));
+    listen(serv_sock, 2);
+
+    while (1) {
+        int client_sock = accept(serv_sock, NULL, NULL);
+        if (client_sock < 0) {
+            k_sleep(K_SECONDS(1)); // Wait before retrying
+            continue;
+        }
+
+        char buf[256];
+        int len = recv(client_sock, buf, sizeof(buf) - 1, 0);
+        buf[len] = 0;
+
+        // Simple request parsing
+        if (strstr(buf, "GET /sensors/hts221")) {
+            struct sensor_value temp, hum;
+            sensor_sample_fetch(hts221);
+            sensor_channel_get(hts221, SENSOR_CHAN_AMBIENT_TEMP, &temp);
+            sensor_channel_get(hts221, SENSOR_CHAN_HUMIDITY, &hum);
+            snprintf(buf, sizeof(buf), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"temp\":%d.%06d, \"humidity\":%d.%06d}", temp.val1, temp.val2, hum.val1, hum.val2);
+        } else {
+            snprintf(buf, sizeof(buf), "HTTP/1.1 404 Not Found\r\n\r\n");
+        }
+
+        send(client_sock, buf, strlen(buf), 0);
+        close(client_sock);
+    }
+}
+#endif
+
+// Toggle LED 1 command
+static void cmd_toggle_led1 (const struct shell *shell, size_t argc, char **argv)
+{
+    if (gpio_pin_get_dt(&led1) > 0) {
+        gpio_pin_set_dt(&led1, 0);
+        shell_print(shell, "LED0 turned OFF");
+    } else {
+        gpio_pin_set_dt(&led1, 1);
+        shell_print(shell, "LED0 turned ON");
+    }
+}
+
+// Work Handlers
 void http_client_work_handler(struct k_work *work) {
     struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, http_work);
 
@@ -374,6 +385,7 @@ void sensor_work_handler(struct k_work *work) {
     fs_close(&file);
 }
 
+// Timer Callbacks
 void sensor_timer_callback(struct k_timer *timer_id) {
     struct sensor_info *sensor = CONTAINER_OF(timer_id, struct sensor_info, timer);
     k_work_submit(&sensor->work);
@@ -384,6 +396,7 @@ void sensor_timer_http_callback(struct k_timer *timer_id) {
     k_work_submit(&sensor->http_work);
 }
 
+// Sensor Timer HTTP Stop Command
 static void cmd_sensor_timer_http_stop (const struct shell *shell, size_t argc, char **argv) {
     if (argc < 2) {
         shell_error(shell, "Usage: sensor_timer_stop <sensor_name>");
@@ -397,6 +410,7 @@ static void cmd_sensor_timer_http_stop (const struct shell *shell, size_t argc, 
     shell_print(shell, "Stopped timer for %s", sensor_name);
 }
 
+// Sensor Timer HTTP Start Command
 static void cmd_sensor_timer_http_start (const struct shell *shell, size_t argc, char **argv){
     if (argc < 3) {
         shell_error(shell, "Usage: sensor_timer_cb <sensor_name> <url> <timing>");
@@ -415,6 +429,7 @@ static void cmd_sensor_timer_http_start (const struct shell *shell, size_t argc,
     k_timer_start(&(sensor->http_timer), K_SECONDS(time), K_SECONDS(time));
 }
 
+// Sensor Timer Start Command
 static void cmd_sensor_timer_start(const struct shell *shell, size_t argc, char **argv){
     if (argc < 3) {
         shell_error(shell, "Usage: sensor_timer <sensor_name> <file_name> <timing>");
@@ -433,6 +448,7 @@ static void cmd_sensor_timer_start(const struct shell *shell, size_t argc, char 
     k_timer_start(&(sensor->timer), K_SECONDS(time), K_SECONDS(time));
 }
 
+// Sensor Timer Stop Command
 static void cmd_sensor_timer_stop (const struct shell *shell, size_t argc, char **argv) {
     if (argc < 2) {
         shell_error(shell, "Usage: sensor_timer_stop <sensor_name>");
@@ -446,6 +462,7 @@ static void cmd_sensor_timer_stop (const struct shell *shell, size_t argc, char 
     shell_print(shell, "Stopped timer for %s", sensor_name);
 }
 
+// Sensor Reading (Returns formatted string of sensor data)
 // TODO we should use the sensors struct instead of hardcoding
 int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
 {
@@ -550,6 +567,7 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
     return used;
 }
 
+// Use sensor_reading to read a sensor and print the result
 static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv)
 {
     if (argc < 2) {
@@ -574,20 +592,11 @@ static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv)
 SHELL_CMD_REGISTER(read, NULL, "Read sensor data", cmd_read_sensor);
 SHELL_CMD_REGISTER(toggle_led1, NULL, "Toggle LED1", cmd_toggle_led1);
 
-
-
 SHELL_CMD_REGISTER(sensor_timer_start, NULL, "Start sensor timer", cmd_sensor_timer_start);
 SHELL_CMD_REGISTER(sensor_timer_stop, NULL, "Stop sensor timer", cmd_sensor_timer_stop);
 
 SHELL_CMD_REGISTER(sensor_timer_http_start, NULL, "Start sensor HTTP timer", cmd_sensor_timer_http_start);
 SHELL_CMD_REGISTER(sensor_timer_http_stop, NULL, "Stop sensor HTTP timer", cmd_sensor_timer_http_stop);
-
-// TESTING
-//SHELL_CMD_REGISTER(schedule, NULL, "Schedule a sensor reading", cmd_schedule_reading);
-//SHELL_CMD_REGISTER(register_callback, NULL, "Register a REST callback for a sensor", cmd_register_callback);
-//K_THREAD_DEFINE(scheduler, 2048, scheduler_thread, NULL, NULL, NULL, 7, 0, 0);
-
-// Handle DHCP assigning IP (set state variable)
 
 void init_sensors() {
     for (int i = 0; i < NUM_SENSORS; i++) {
@@ -655,8 +664,6 @@ void main(void)
     // Initialize Sensors and Triggers
     init_sensors();
 
-
-    
     printk("System Initialized. Entering main loop.\n");
 
     while (1) {
