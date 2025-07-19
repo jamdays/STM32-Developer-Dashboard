@@ -105,7 +105,30 @@ enum {
     BIT_7 = 0x40,  // Bit 6 set
     BIT_8 = 0x80   // Bit 7 set
 };
+
+enum sensor_names {
+    HTS221,
+    LPS22HB,
+    LIS3MDL,
+    LSM6DSL,
+    VL53L0X,
+    BUTTON0
+};
+
 const struct device *i2c_dev = DEVICE_DT_GET(I2C_NODE);
+
+volatile int lsm6dsl_mode = 0; // 0 - normal, 1 - step, 2 - tap
+volatile int lsm6dsl_action_mode = 0; // 0 - normal, 1 - step, 2 - tap
+enum {
+    LSM6DSL_MODE_NORMAL = 0,
+    LSM6DSL_MODE_STEP = 1,
+    LSM6DSL_MODE_TAP = 2
+};
+
+enum {
+    MODE_FILE = 0,
+    MODE_HTTP = 1
+};
 // INTERRUPTS
 
 // Sensor device nodes
@@ -152,9 +175,7 @@ static const struct gpio_dt_spec int1_gpio = {
 
 static struct gpio_callback gpio_cb;
 
-void int1_handler(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
-    printk("INT1 triggered (step or free fall)\n");
-}
+
 
 
 // INTERRUPTS
@@ -181,11 +202,13 @@ struct sensor_info {
     void * timer_callback;
     void * http_timer_callback;
     const char *cb_filename;
+    const char *interrupt_cb_filename;
     int num_axes;
     struct axes_info *axes;
     struct k_work work;
     struct k_work http_work; // For HTTP client
     struct k_work interrupt_work; // For HTTP client
+    struct k_work interrupt_file_work; // For HTTP client
     const char * url; // For HTTP client
 };
 
@@ -195,14 +218,7 @@ struct sensor_save_work {
     char file_name[64]; // File name to save data
 };
 
-enum sensor_names {
-    HTS221,
-    LPS22HB,
-    LIS3MDL,
-    LSM6DSL,
-    VL53L0X,
-    BUTTON0
-};
+
 
 static struct axes_list hts221_axes[] = {
     { .chan = SENSOR_CHAN_AMBIENT_TEMP, .name = "temperature" },
@@ -313,6 +329,62 @@ int get_sensor_index(char *sensor_name) {
 }
 
 static void http_client_work_handler(struct k_work *work);
+
+void int1_handler(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
+    printk("INT1 triggered (step or free fall)\n");
+    switch (lsm6dsl_mode) {
+        case LSM6DSL_MODE_STEP:
+            // Handle step detection
+            uint8_t step_count_l, step_count_h;
+            lsm6dsl_read_reg(STEP_COUNTER_L, &step_count_l, 1);
+            lsm6dsl_read_reg(STEP_COUNTER_H, &step_count_h, 1);
+            int step_count = (step_count_h << 8) | step_count_l;
+            printk("Step count: %d\n", step_count);
+            break;
+
+        case LSM6DSL_MODE_TAP:
+            // Handle tap detection
+            //uint8_t tap_src;
+            //lsm6dsl_read_reg(TAP_SRC, &tap_src, 1);
+            /*if (tap_src & TAP_X_EN) {
+                printk("Tap detected on X axis\n");
+            }
+            if (tap_src & TAP_Y_EN) {
+                printk("Tap detected on Y axis\n");
+            }
+            if (tap_src & TAP_Z_EN) {
+                printk("Tap detected on Z axis\n");
+            }*/
+            //printk("Tap source: 0x%02x\n", tap_src);
+            switch (lsm6dsl_action_mode) {
+                case MODE_FILE: {
+                    // Write tap data to file
+                    struct sensor_info *sensor = &sensors[LSM6DSL];
+                    
+                    k_work_submit(&sensor->interrupt_work);
+                    printk("Tap data written to file\n");
+                }
+                break;
+
+                case MODE_HTTP: {
+                    // Send tap data via HTTP
+                    struct sensor_info *sensor = &sensors[LSM6DSL];
+                    snprintf(sensor->url, sizeof(sensor->url), "http://example.com/tap_data");
+                    k_work_submit(&sensor->http_work);
+                    printk("Tap data sent via HTTP\n");
+                }
+                break;
+
+                default:
+                    printk("No action for current mode\n");
+            }
+            break;
+
+        default:
+            printk("No action for current mode\n");
+    }
+}
+
 
 // Sensor Reading command
 static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv);
@@ -482,18 +554,39 @@ void sensor_work_handler(struct k_work *work) {
 }
 
 void interrupt_work_handler(struct k_work *work) {
-    struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, interrupt_work);
+    //struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, interrupt_work);
+    struct sensor_info *sensor = &sensors[LSM6DSL];
     printk("Interrupt work handler for sensor %s\n", sensor->name);
-
-    // Handle the interrupt event here
-    // For example, read the sensor data and print it
+    char full_path[128];
+    snprintf(full_path, sizeof(full_path), "/lfs/%s", sensor->interrupt_cb_filename);
+    struct fs_file_t file;
+    fs_file_t_init(&file);
+    int ret = fs_open(&file, full_path, FS_O_CREATE | FS_O_APPEND);
+    if (ret < 0) {
+        printk("Failed to open file %s: %d\n", full_path, ret);
+        return;
+    }
+    // Write the interrupt data to the file
     char buf[128];
-    int ret = sensor_reading(sensor->name, buf, sizeof(buf));
+    ret = sensor_reading(sensor->name, buf, sizeof(buf));
     if (ret < 0) {
         printk("Sensor read failed: %d\n", ret);
+        fs_close(&file);
+        return;
+    }
+    // Make sure the result is a full line
+    size_t len = strlen(buf);
+    if (len < sizeof(buf) - 1) {
+        buf[len] = '\0';
+    }
+    ret = fs_write(&file, buf, len);
+    if (ret < 0) {
+        printk("Failed to write to file %s: %d\n", full_path, ret);
+        fs_close(&file);
         return;
     }
     printk("Sensor %s interrupt data: %s\n", sensor->name, buf);
+    fs_close(&file);
 }
 
 // Timer Callbacks
@@ -653,16 +746,21 @@ static void cmd_lsm6dsl_step_start(const struct shell *shell, size_t argc, char 
         shell_error(shell, "Usage: lsm6dsl_step_start <filename>");
         return;
     }
+    sensors[LSM6DSL].interrupt_cb_filename = argv[1];
+    //strcpy(sensors[LSM6DSL].interrupt_cb_filename, argv[1]);
 
     /*int ret = lsm6dsl_init(&sensor_ctx, lsm6dsl_event_handler);
     if (ret != 0) {
         printk("Sensor init failed: %d\n", ret);
         return ret;
     }*/
-
+    // Initialize the LSM6DSL sensor
+    //sensors[LSM6DSL].interrupt_cb_filename= argv[1];
     //lsm6dsl_enable_tap_sensor(&sensor_ctx);
     enable_single_tap_sensor();
-    enable_single_tap_sensor();
+    lsm6dsl_mode = LSM6DSL_MODE_TAP;
+    lsm6dsl_action_mode = MODE_FILE;
+    //enable_single_tap_sensor();
 
     // Start the step detection timer
     //k_timer_init(&sensors[LSM6DSL].timer, lsm6dsl_event_handler, NULL);
