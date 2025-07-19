@@ -41,8 +41,10 @@ static int cmd_cat(const struct shell *shell, size_t argc, char **argv)
     fs_file_t_init(&file);
     int rc;
     char * filepath = argv[1];
+    char full_path[64];
+    snprintf(full_path, sizeof(full_path), "/lfs/%s", filepath);
 
-    rc = fs_open(&file, filepath, FS_O_READ);
+    rc = fs_open(&file, full_path, FS_O_READ);
     if (rc == -ENOENT) {
         shell_print(shell, "File doesn't exist: %s", filepath);
         return 0;

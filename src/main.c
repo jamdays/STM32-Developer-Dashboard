@@ -32,10 +32,13 @@
 
 #include "wifi.h"
 #include "filesys.h"
+#include "lsm6dsl_step.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 #define NUM_SENSORS 6
+#define I2C_NODE DT_NODELABEL(i2c2)
+#define GPIO_NODE DT_ALIAS(gpiod)
 
 // Sensor device nodes
 static const struct device *const hts221 = DEVICE_DT_GET_ANY(st_hts221);
@@ -43,6 +46,7 @@ static const struct device *const lps22hb = DEVICE_DT_GET_ANY(st_lps22hb_press);
 static const struct device *const lis3mdl = DEVICE_DT_GET_ANY(st_lis3mdl_magn);
 static const struct device *const lsm6dsl = DEVICE_DT_GET_ANY(st_lsm6dsl);
 static const struct device *const vl53l0x = DEVICE_DT_GET_ANY(st_vl53l0x);
+static const struct device *const i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c2));
 
 // LED and button nodes
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
@@ -86,6 +90,7 @@ struct sensor_info {
     struct axes_info *axes;
     struct k_work work;
     struct k_work http_work; // For HTTP client
+    struct k_work interrupt_work; // For HTTP client
     const char * url; // For HTTP client
 };
 
@@ -131,10 +136,6 @@ static struct axes_list lsm6dsl_axes[] = {
 static struct axes_list vl53l0x_axes[] = {
     { .chan = SENSOR_CHAN_PROX, .name = "proximity" }
 };
-
-
-
-
 
 void sensor_timer_callback(struct k_timer *timer_id);
 
@@ -291,7 +292,7 @@ void http_client_work_handler(struct k_work *work) {
 
     char buf[128];           // Larger buffer to ensure full string fits
     struct http_request req;
-    static uint8_t recv_buf[512];
+    //static uint8_t recv_buf[512];
     int sock;
     struct addrinfo *res;
     struct addrinfo hints = {
@@ -385,6 +386,21 @@ void sensor_work_handler(struct k_work *work) {
     fs_close(&file);
 }
 
+void interrupt_work_handler(struct k_work *work) {
+    struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, interrupt_work);
+    printk("Interrupt work handler for sensor %s\n", sensor->name);
+
+    // Handle the interrupt event here
+    // For example, read the sensor data and print it
+    char buf[128];
+    int ret = sensor_reading(sensor->name, buf, sizeof(buf));
+    if (ret < 0) {
+        printk("Sensor read failed: %d\n", ret);
+        return;
+    }
+    printk("Sensor %s interrupt data: %s\n", sensor->name, buf);
+}
+
 // Timer Callbacks
 void sensor_timer_callback(struct k_timer *timer_id) {
     struct sensor_info *sensor = CONTAINER_OF(timer_id, struct sensor_info, timer);
@@ -394,6 +410,12 @@ void sensor_timer_callback(struct k_timer *timer_id) {
 void sensor_timer_http_callback(struct k_timer *timer_id) {
     struct sensor_info *sensor = CONTAINER_OF(timer_id, struct sensor_info, http_timer);
     k_work_submit(&sensor->http_work);
+}
+
+// Handler
+void lsm6dsl_event_handler(const struct device *port, struct gpio_callback *cb, uint32_t pins){
+    printk("LSM6DSL event handler triggered\n");
+    k_work_submit(&sensors[LSM6DSL].interrupt_work);
 }
 
 // Sensor Timer HTTP Stop Command
@@ -446,6 +468,35 @@ static void cmd_sensor_timer_start(const struct shell *shell, size_t argc, char 
     sensor->cb_filename = file_name;
     k_timer_init(&(sensor->timer), sensor->timer_callback, NULL);
     k_timer_start(&(sensor->timer), K_SECONDS(time), K_SECONDS(time));
+}
+
+static void cmd_lsm6dsl_step_start(const struct shell *shell, size_t argc, char **argv) {
+    if (argc < 2) {
+        shell_error(shell, "Usage: lsm6dsl_step_start <filename>");
+        return;
+    }
+
+    lsm6dsl_ctx_t sensor_ctx = {
+        .i2c_dev = i2c_dev,
+    };
+
+    int ret = lsm6dsl_init(&sensor_ctx, lsm6dsl_event_handler);
+    if (ret != 0) {
+        printk("Sensor init failed: %d\n", ret);
+        return ret;
+    }
+
+    lsm6dsl_enable_tap_sensor(&sensor_ctx);
+    // Start the step detection timer
+    //k_timer_init(&sensors[LSM6DSL].timer, lsm6dsl_event_handler, NULL);
+    //k_timer_start(&sensors[LSM6DSL].timer, K_SECONDS(time), K_SECONDS(time));
+    shell_print(shell, "Started LSM6DSL step detection with %d seconds interval", time);
+}
+
+static void cmd_lsm6dsl_step_stop(const struct shell *shell, size_t argc, char **argv) {
+    // Stop the LSM6DSL step detection timer
+    //k_timer_stop(&sensors[LSM6DSL].timer);
+    shell_print(shell, "Stopped LSM6DSL step detection");
 }
 
 // Sensor Timer Stop Command
@@ -598,6 +649,9 @@ SHELL_CMD_REGISTER(sensor_timer_stop, NULL, "Stop sensor timer", cmd_sensor_time
 SHELL_CMD_REGISTER(sensor_timer_http_start, NULL, "Start sensor HTTP timer", cmd_sensor_timer_http_start);
 SHELL_CMD_REGISTER(sensor_timer_http_stop, NULL, "Stop sensor HTTP timer", cmd_sensor_timer_http_stop);
 
+SHELL_CMD_REGISTER(test, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_step_start);
+SHELL_CMD_REGISTER(lsm6dsl_step_stop, NULL, "Stop LSM6DSL event handler", cmd_lsm6dsl_step_stop);
+
 void init_sensors() {
     for (int i = 0; i < NUM_SENSORS; i++) {
         if (sensors[i].dev_or_gpio == TYPE_DEV) {
@@ -618,6 +672,7 @@ void init_sensors() {
         k_timer_init(&sensors[i].timer, sensors[i].timer_callback, NULL);
         k_work_init(&sensors[i].work, sensor_work_handler);
         k_work_init(&sensors[i].http_work, http_client_work_handler);
+        k_work_init(&sensors[i].interrupt_work, interrupt_work_handler);
         sensors[i].cb_filename = k_malloc(64);
         sensors[i].url = k_malloc(128);
         struct sensor_value odr_attr;
@@ -663,6 +718,7 @@ void main(void)
 
     // Initialize Sensors and Triggers
     init_sensors();
+
 
     printk("System Initialized. Entering main loop.\n");
 
