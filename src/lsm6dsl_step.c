@@ -104,7 +104,7 @@ void lsm6dsl_enable_tap_sensor(lsm6dsl_ctx_t *ctx_dev) {
     ret = lsm6dsl_write_reg(ctx, WAKE_UP_THS, &val); // Set wake-up threshold
 
     ret = lsm6dsl_read_reg(ctx, MD1_CFG, &val);
-    val = 0x08;
+    val |= 0x08;
     ret = lsm6dsl_write_reg(ctx, MD1_CFG, &val); //MD1_CFG
 
 }

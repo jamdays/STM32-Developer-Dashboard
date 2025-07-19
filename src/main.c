@@ -30,15 +30,83 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/kernel.h>
 
+#include <zephyr/drivers/i2c.h>
+
 #include "wifi.h"
 #include "filesys.h"
-#include "lsm6dsl_step.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 #define NUM_SENSORS 6
-#define I2C_NODE DT_NODELABEL(i2c2)
-#define GPIO_NODE DT_ALIAS(gpiod)
+// INTERRUPTS
+#define I2C_NODE    DT_NODELABEL(i2c2)
+#define I2C_ADDR 0x6A
+
+#define INT1_PORT   "GPIOD"
+#define INT1_PIN 0xb
+
+#define WHO_AM_I_REG 0x0F
+#define LSM6DSL_WHO_AM_I_EXPECTED 0x6A
+
+typedef struct
+{
+    bool why_not;
+} stmdev_ctx_t;
+
+// LSM6DSL REGISTERS
+#define FUNC_CFG_ACCESS 0x01
+#define CTRL1_XL 0x10
+#define CTRL10_C 0x19
+#define MD1_CFG 0x5E
+#define TAP_CFG 0x58
+#define TAP_THS_6D 0x59
+#define INT_DUR2 0x5a
+#define WAKE_UP_THS 0x5b
+#define INT1_CTRL 0x0D
+#define TAP_SRC 0x1C
+#define FUNC_SRC1 0x53
+#define FUNC_SRC2 0x54
+#define WAKE_UP_SRC 0x1B
+#define STEP_COUNTER_L 0x4B
+#define STEP_COUNTER_H 0x4C
+
+// BANK A
+#define CONFIG_PEDO_THS_MIN 0x0F
+
+//FUNC_CFG_ACCESS 
+enum {
+    FUNC_CFG_EN_B = 0x20,  // Bit 5 set
+    FUNC_CFG_EN = 0x80   // Bit 7 set
+};
+
+// TAP_CFG
+enum {
+
+    LIR = 0x01,  // Bit 0 set
+    TAP_Z_EN = 0x02,  // Bit 1 set
+    TAP_Y_EN = 0x04,  // Bit 2 set
+    TAP_X_EN = 0x08,  // Bit 3 set
+    SLOPE_FDS= 0x10,  // Bit 4 set
+    INACT_EN0 = 0x20,  // Bit 5 set
+    INACT_EN1 = 0x40,  // Bit 6 set
+    INTERRUPTS_ENABLE = 0x80   // Bit 7 set
+};
+
+
+
+// FUNC_SRC1 - 0x53
+enum {
+    SENSORHUB_END_OP = 0x01,  // Bit 0 set
+    SI_END_OP = 0x02,  // Bit 1 set
+    HI_FAIL = 0x04,  // Bit 2 set
+    STEP_DETECTED = 0x08,  // Bit 3 set
+    BIT_5 = 0x10,  // Bit 4 set
+    BIT_6 = 0x20,  // Bit 5 set
+    BIT_7 = 0x40,  // Bit 6 set
+    BIT_8 = 0x80   // Bit 7 set
+};
+const struct device *i2c_dev = DEVICE_DT_GET(I2C_NODE);
+// INTERRUPTS
 
 // Sensor device nodes
 static const struct device *const hts221 = DEVICE_DT_GET_ANY(st_hts221);
@@ -46,7 +114,6 @@ static const struct device *const lps22hb = DEVICE_DT_GET_ANY(st_lps22hb_press);
 static const struct device *const lis3mdl = DEVICE_DT_GET_ANY(st_lis3mdl_magn);
 static const struct device *const lsm6dsl = DEVICE_DT_GET_ANY(st_lsm6dsl);
 static const struct device *const vl53l0x = DEVICE_DT_GET_ANY(st_vl53l0x);
-static const struct device *const i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c2));
 
 // LED and button nodes
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
@@ -63,6 +130,34 @@ static struct fs_mount_t littlefs_mnt = {
     .storage_dev = (void *)FIXED_PARTITION_ID(storage_partition),
     .mnt_point = "/lfs"
 };
+
+// INTERRUPTS
+int32_t lsm6dsl_read_reg(uint8_t reg, uint8_t *data, uint16_t len) {
+    return i2c_burst_read(i2c_dev, I2C_ADDR, reg, data, len);
+}
+
+int32_t lsm6dsl_write_reg(uint8_t reg, const uint8_t *data, uint16_t len) {
+    return i2c_burst_write(i2c_dev, I2C_ADDR, reg, data, len);    
+}
+
+static void platform_delay(uint32_t ms) {
+    k_msleep(ms);
+}
+
+static const struct gpio_dt_spec int1_gpio = {
+    .port = DEVICE_DT_GET(DT_NODELABEL(gpiod)),
+    .pin = INT1_PIN,
+    .dt_flags = GPIO_INPUT | GPIO_INT_EDGE_TO_ACTIVE
+};
+
+static struct gpio_callback gpio_cb;
+
+void int1_handler(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
+    printk("INT1 triggered (step or free fall)\n");
+}
+
+
+// INTERRUPTS
 
 // Sensor Info
 enum sensor_type {
@@ -470,27 +565,109 @@ static void cmd_sensor_timer_start(const struct shell *shell, size_t argc, char 
     k_timer_start(&(sensor->timer), K_SECONDS(time), K_SECONDS(time));
 }
 
+void enable_tap_sensor() {
+    uint8_t val;
+    int32_t ret;
+    
+    ret = lsm6dsl_read_reg(CTRL1_XL, &val, 1); // CRTL1_XL
+    printk("CTRL1_XL: %02x\n", val);
+    val = 0x60;
+    ret = lsm6dsl_write_reg(CTRL1_XL, &val, 1);
+    
+    ret = lsm6dsl_read_reg(TAP_CFG, &val, 1); // TAP_CFG
+    printk("TAP_CFG: %02x\n", val);
+    val = 0x8e;
+    ret = lsm6dsl_write_reg(TAP_CFG, &val, 1);
+
+    ret = lsm6dsl_read_reg(TAP_THS_6D, &val, 1); // TAP_THS_6D
+    printk("TAP_THS_6D: %02x\n", val); 
+    val = 0x8c;
+    ret = lsm6dsl_write_reg(TAP_THS_6D, &val, 1);
+
+    ret = lsm6dsl_read_reg(INT_DUR2, &val, 1); // INT_DUR2
+    printk("INT_DUR2: %02x\n", val);
+    val = 0x7f; // Set duration for tap detection
+    ret = lsm6dsl_write_reg(INT_DUR2, &val, 1);
+
+    ret = lsm6dsl_read_reg(WAKE_UP_THS, &val, 1); // WAKE_UP_THS
+    printk("WAKE_UP_THS: %02x\n", val);
+    val = 0x80; // Set wake-up threshold
+    ret = lsm6dsl_write_reg(WAKE_UP_THS, &val, 1); // Set wake-up threshold
+
+    ret = lsm6dsl_read_reg(MD1_CFG, &val, 1);
+    printk("MD1_CFG: %02x\n", val);
+    val = 0x08;
+    ret = lsm6dsl_write_reg(MD1_CFG, &val, 1); //MD1_CFG
+    
+    ret = lsm6dsl_read_reg(INT1_CTRL, &val, 1);
+    printk("INT1_CTRL: %02x\n", val);
+    val = 0x80; // Set wake-up threshold
+    ret = lsm6dsl_write_reg(INT1_CTRL, &val, 1); 
+}
+
+void enable_single_tap_sensor() {
+    uint8_t val;
+    int32_t ret;
+    
+    ret = lsm6dsl_read_reg(CTRL1_XL, &val, 1); // CRTL1_XL
+    printk("CTRL1_XL: %02x\n", val);
+    val = 0x60;
+    ret = lsm6dsl_write_reg(CTRL1_XL, &val, 1);
+    
+    ret = lsm6dsl_read_reg(TAP_CFG, &val, 1); // TAP_CFG
+    printk("TAP_CFG: %02x\n", val);
+    val = 0x8e;
+    ret = lsm6dsl_write_reg(TAP_CFG, &val, 1);
+
+    ret = lsm6dsl_read_reg(TAP_THS_6D, &val, 1); // TAP_THS_6D
+    printk("TAP_THS_6D: %02x\n", val); 
+    val = 0x89;
+    ret = lsm6dsl_write_reg(TAP_THS_6D, &val, 1);
+
+    ret = lsm6dsl_read_reg(INT_DUR2, &val, 1); // INT_DUR2
+    printk("INT_DUR2: %02x\n", val);
+    val = 0x06; // Set duration for tap detection
+    ret = lsm6dsl_write_reg(INT_DUR2, &val, 1);
+
+    ret = lsm6dsl_read_reg(WAKE_UP_THS, &val, 1); // WAKE_UP_THS
+    printk("WAKE_UP_THS: %02x\n", val);
+    val = 0x00; // Set wake-up threshold
+    ret = lsm6dsl_write_reg(WAKE_UP_THS, &val, 1); // Set wake-up threshold
+
+    ret = lsm6dsl_read_reg(MD1_CFG, &val, 1);
+    printk("MD1_CFG: %02x\n", val);
+    val = 0x40;
+    ret = lsm6dsl_write_reg(MD1_CFG, &val, 1); //MD1_CFG
+
+        ret = lsm6dsl_read_reg(INT1_CTRL, &val, 1);
+    printk("INT1_CTRL: %02x\n", val);
+    val = 0x80; // Set wake-up threshold
+    ret = lsm6dsl_write_reg(INT1_CTRL, &val, 1); 
+
+    //lsm6dsl_write_reg(0x01, &(uint8_t){0x00}, 1);
+
+}
+
 static void cmd_lsm6dsl_step_start(const struct shell *shell, size_t argc, char **argv) {
     if (argc < 2) {
         shell_error(shell, "Usage: lsm6dsl_step_start <filename>");
         return;
     }
 
-    lsm6dsl_ctx_t sensor_ctx = {
-        .i2c_dev = i2c_dev,
-    };
-
-    int ret = lsm6dsl_init(&sensor_ctx, lsm6dsl_event_handler);
+    /*int ret = lsm6dsl_init(&sensor_ctx, lsm6dsl_event_handler);
     if (ret != 0) {
         printk("Sensor init failed: %d\n", ret);
         return ret;
-    }
+    }*/
 
-    lsm6dsl_enable_tap_sensor(&sensor_ctx);
+    //lsm6dsl_enable_tap_sensor(&sensor_ctx);
+    enable_single_tap_sensor();
+    enable_single_tap_sensor();
+
     // Start the step detection timer
     //k_timer_init(&sensors[LSM6DSL].timer, lsm6dsl_event_handler, NULL);
     //k_timer_start(&sensors[LSM6DSL].timer, K_SECONDS(time), K_SECONDS(time));
-    shell_print(shell, "Started LSM6DSL step detection with %d seconds interval", time);
+    //shell_print(shell, "Started LSM6DSL step detection with %d seconds interval", time);
 }
 
 static void cmd_lsm6dsl_step_stop(const struct shell *shell, size_t argc, char **argv) {
@@ -675,7 +852,7 @@ void init_sensors() {
         k_work_init(&sensors[i].interrupt_work, interrupt_work_handler);
         sensors[i].cb_filename = k_malloc(64);
         sensors[i].url = k_malloc(128);
-        struct sensor_value odr_attr;
+        /*struct sensor_value odr_attr;
         odr_attr.val1 = 104; // Set ODR to 100 Hz
         odr_attr.val2 = 0;
 
@@ -684,7 +861,7 @@ void init_sensors() {
         }
         if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
             printk("Failed to set LSM6DSL Gyro ODR\n");
-        }
+        }*/
     }
 }
 
@@ -719,6 +896,27 @@ void main(void)
     // Initialize Sensors and Triggers
     init_sensors();
 
+    // INTERRUPTS
+    int ret = gpio_pin_configure_dt(&int1_gpio, GPIO_INPUT | GPIO_INT_EDGE_RISING);
+    if (ret != 0) {
+        printk("Failed to configure INT1 GPIO: %d\n", ret);
+        return -1;
+    }
+    gpio_init_callback(&gpio_cb, int1_handler, BIT(int1_gpio.pin));
+    ret = gpio_add_callback(int1_gpio.port, &gpio_cb);
+    if (ret != 0) {
+        printk("Failed to add GPIO callback: %d\n", ret);
+        return -1;
+    }
+
+    ret = gpio_pin_interrupt_configure_dt(&int1_gpio, GPIO_INT_EDGE_RISING);
+    if (ret != 0) {
+        printk("Failed to enable INT1 interrupt: %d\n", ret);
+        return -1;
+    }
+
+    printk("INT1 interrupt configured on GPIOD pin %d\n", int1_gpio.pin);
+    // INTERRUPTS
 
     printk("System Initialized. Entering main loop.\n");
 
