@@ -77,7 +77,10 @@ void cmd_rm(const struct shell *shell, size_t argc, char **argv) {
         shell_error(shell, "Usage: rm <file_name>");
         return;
     }
-    const char *file_name = argv[1];
+    //const char *file_name = argv[1];
+    char * filepath = argv[1];
+    char file_name[64];
+    snprintf(file_name, sizeof(file_name), "/lfs/%s", filepath);
     int rc = fs_unlink(file_name);
     if (rc < 0) {
         shell_error(shell, "Failed to remove file %s: %d", file_name, rc);
