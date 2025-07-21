@@ -485,23 +485,12 @@ void http_client_work_handler(struct k_work *work) {
         return;
     }
     
-    struct sockaddr_in addr = {0};
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);
-    addr.sin_addr = *((struct in_addr *)res->ai_addr->data + 2); // Copy the resolved address
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    connect(sock, (struct sockaddr *)res->ai_addr, sizeof(res->ai_addr));
     char _buf[256]; // Buffer for the HTTP request
     char * msg_template = "POST /%s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s";
     snprintf(_buf, sizeof(_buf), msg_template, path, host, len, buf);
     write(sock, _buf, strlen(_buf));
-    close(sock);
-
-    if (http_client_req(sock, &req, 5000, NULL) < 0) {
-        printk("HTTP client request failed\n");
-    }
-
     close(sock);
 }
 
