@@ -15,8 +15,7 @@ direct
 ```
 
 Now, you can interact with the UART shell! Try out some of the following commands:
-`help`
-`read lsm6ds`
+`help`, `read lsm6dsl`
 
 ## Guide: storing periodic sensor readings to onboard storage
 All sensor readings can be stored onto the board's flash storage!
