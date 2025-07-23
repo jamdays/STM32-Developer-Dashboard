@@ -18,8 +18,8 @@ volatile bool wifi_is_ready;
 
 int cmd_wifi_connect(const struct shell *shell, size_t argc, char **argv);
 
-void cmd_wifi_save(const struct shell *shell, size_t argc, char **argv);
+static void cmd_wifi_save(const struct shell *shell, size_t argc, char **argv);
 
-void cmd_wifi_reconnect(const struct shell *shell, size_t argc, char **argv);
+static void cmd_wifi_reconnect(const struct shell *shell, size_t argc, char **argv);
 
 #endif
