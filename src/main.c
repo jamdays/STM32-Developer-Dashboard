@@ -30,10 +30,108 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/kernel.h>
 
+#include <zephyr/drivers/i2c.h>
+
+#include "wifi.h"
+#include "filesys.h"
+
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 #define NUM_SENSORS 6
-#define SCHEDULE_FILE "/lfs/schedule.txt"
+// INTERRUPTS
+#define I2C_NODE    DT_NODELABEL(i2c2)
+#define I2C_ADDR 0x6A
+
+#define INT1_PORT   "GPIOD"
+#define INT1_PIN 0xb
+
+#define WHO_AM_I_REG 0x0F
+#define LSM6DSL_WHO_AM_I_EXPECTED 0x6A
+
+typedef struct
+{
+    bool why_not;
+} stmdev_ctx_t;
+
+// LSM6DSL REGISTERS
+#define FUNC_CFG_ACCESS 0x01
+#define CTRL1_XL 0x10
+#define CTRL10_C 0x19
+#define MD1_CFG 0x5E
+#define TAP_CFG 0x58
+#define TAP_THS_6D 0x59
+#define INT_DUR2 0x5a
+#define WAKE_UP_THS 0x5b
+#define INT1_CTRL 0x0D
+#define TAP_SRC 0x1C
+#define FUNC_SRC1 0x53
+#define FUNC_SRC2 0x54
+#define WAKE_UP_SRC 0x1B
+#define STEP_COUNTER_L 0x4B
+#define STEP_COUNTER_H 0x4C
+#define CTRL1_XL 0x10
+#define CTRL10_C 0x19
+
+// BANK A
+#define CONFIG_PEDO_THS_MIN 0x0F
+
+//FUNC_CFG_ACCESS 
+enum {
+    FUNC_CFG_EN_B = 0x20,  // Bit 5 set
+    FUNC_CFG_EN = 0x80   // Bit 7 set
+};
+
+// TAP_CFG
+enum {
+
+    LIR = 0x01,  // Bit 0 set
+    TAP_Z_EN = 0x02,  // Bit 1 set
+    TAP_Y_EN = 0x04,  // Bit 2 set
+    TAP_X_EN = 0x08,  // Bit 3 set
+    SLOPE_FDS= 0x10,  // Bit 4 set
+    INACT_EN0 = 0x20,  // Bit 5 set
+    INACT_EN1 = 0x40,  // Bit 6 set
+    INTERRUPTS_ENABLE = 0x80   // Bit 7 set
+};
+
+
+
+// FUNC_SRC1 - 0x53
+enum {
+    SENSORHUB_END_OP = 0x01,  // Bit 0 set
+    SI_END_OP = 0x02,  // Bit 1 set
+    HI_FAIL = 0x04,  // Bit 2 set
+    STEP_DETECTED = 0x08,  // Bit 3 set
+    BIT_5 = 0x10,  // Bit 4 set
+    BIT_6 = 0x20,  // Bit 5 set
+    BIT_7 = 0x40,  // Bit 6 set
+    BIT_8 = 0x80   // Bit 7 set
+};
+
+enum sensor_names {
+    HTS221,
+    LPS22HB,
+    LIS3MDL,
+    LSM6DSL,
+    VL53L0X,
+    BUTTON0
+};
+
+const struct device *i2c_dev = DEVICE_DT_GET(I2C_NODE);
+
+volatile int lsm6dsl_mode = 0; // 0 - normal, 1 - step, 2 - tap
+volatile int lsm6dsl_action_mode = 0; // 0 - normal, 1 - step, 2 - tap
+enum {
+    LSM6DSL_MODE_NORMAL = 0,
+    LSM6DSL_MODE_STEP = 1,
+    LSM6DSL_MODE_TAP = 2
+};
+
+enum {
+    MODE_FILE = 0,
+    MODE_HTTP = 1
+};
+// INTERRUPTS
 
 // Sensor device nodes
 static const struct device *const hts221 = DEVICE_DT_GET_ANY(st_hts221);
@@ -48,6 +146,43 @@ static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static struct gpio_callback button_cb_data;
 
+
+// Filesystem
+FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(cstorage);
+static struct fs_mount_t littlefs_mnt = {
+    .type = FS_LITTLEFS,
+    .fs_data = &cstorage,
+    .storage_dev = (void *)FIXED_PARTITION_ID(storage_partition),
+    .mnt_point = "/lfs"
+};
+
+// INTERRUPTS
+int32_t lsm6dsl_read_reg(uint8_t reg, uint8_t *data, uint16_t len) {
+    return i2c_burst_read(i2c_dev, I2C_ADDR, reg, data, len);
+}
+
+int32_t lsm6dsl_write_reg(uint8_t reg, const uint8_t *data, uint16_t len) {
+    return i2c_burst_write(i2c_dev, I2C_ADDR, reg, data, len);    
+}
+
+static void platform_delay(uint32_t ms) {
+    k_msleep(ms);
+}
+
+static const struct gpio_dt_spec int1_gpio = {
+    .port = DEVICE_DT_GET(DT_NODELABEL(gpiod)),
+    .pin = INT1_PIN,
+    .dt_flags = GPIO_INPUT | GPIO_INT_EDGE_TO_ACTIVE
+};
+
+static struct gpio_callback gpio_cb;
+
+
+
+
+// INTERRUPTS
+
+// Sensor Info
 enum sensor_type {
     TYPE_DEV,
     TYPE_GPIO
@@ -59,6 +194,7 @@ struct axes_list {
 };
 
 struct sensor_info {
+
     bool dev_or_gpio;
     const struct device *dev;
     const struct gpio_dt_spec *gpio;
@@ -68,443 +204,16 @@ struct sensor_info {
     void * timer_callback;
     void * http_timer_callback;
     const char *cb_filename;
+    const char *interrupt_cb_filename;
     int num_axes;
     struct axes_info *axes;
-    struct k_work work;
+    struct k_work work; // File client
     struct k_work http_work; // For HTTP client
-    const char * url; // For HTTP client
+    struct k_work interrupt_work; // For interrupt file client 
+    struct k_work interrupt_http_work; // For interrupt HTTP client
+    const char * url; // For timer HTTP client
+    const char * interrupt_url; // For interrupt HTTP client
 };
-
-// Filesystem
-FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(cstorage);
-static struct fs_mount_t littlefs_mnt = {
-    .type = FS_LITTLEFS,
-    .fs_data = &cstorage,
-    .storage_dev = (void *)FIXED_PARTITION_ID(storage_partition),
-    .mnt_point = "/lfs"
-};
-
-// Wifi
-#define WIFI_CONFIG_FILE "/lfs/wifi.conf"
-static struct net_if *iface;
-static struct wifi_connect_req_params wifi_params;
-static struct net_mgmt_event_callback wifi_cb;
-volatile char *ssid = NULL;
-volatile char *password = NULL;
-
-volatile bool wifi_is_ready = false;
-
-// Sensor Info
-
-// REST client
-#define MAX_CALLBACKS 5
-struct sensor_callback {
-    const char *sensor_name;
-    char url[128];
-};
-static struct sensor_callback callbacks[MAX_CALLBACKS];
-static int callback_count = 0;
-
-
-
-// Work queue for handling http interrupts
-#ifdef CONFIG_HTTP_CLIENT
-K_THREAD_STACK_DEFINE(http_work_q_stack, 2048);
-static struct k_work_q http_work_q;
-struct http_work {
-    struct k_work work;
-    char url[128];
-    char data[128];
-};
-#endif
-
-
-#ifdef CONFIG_HTTP_CLIENT
-static void http_client_work_handler(struct k_work *work);
-#endif
-
-// Forward declarations for shell commands
-static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv);
-
-static void http_response_cb(struct http_response *rsp, enum http_final_call final_data, void *user_data)
-{
-    if (final_data == HTTP_DATA_FINAL) {
-        printk("REST call finished with status: %s\n", rsp->http_status);
-    }
-}
-
-// Make HTTP Request
-#ifdef CONFIG_HTTP_CLIENT
-static void http_client_work_handler_old2(struct k_work *work)
-{
-    //struct http_work *http_work_item = CONTAINER_OF(http_work, struct http_work, http_work);
-    struct http_work *http_work_item;
-    struct http_request req;
-    static uint8_t recv_buf[512];
-    int sock;
-    struct addrinfo *res;
-    struct addrinfo hints = {
-        .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM,
-    };
-
-    // Basic URL parsing
-    char *host = http_work_item->url;
-    char *path = strchr(host, '/');
-    if (path) {
-        *path = 0;
-        path++;
-    } else {
-        path = "";
-    }
-
-    if (getaddrinfo(host, "80", &hints, &res) != 0) {
-        printk("Failed to resolve hostname: %s\n", host);
-        return;
-    }
-
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) {
-        printk("Failed to create socket\n");
-        freeaddrinfo(res);
-        return;
-    }
-
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        printk("Failed to connect to server\n");
-        close(sock);
-        freeaddrinfo(res);
-        return;
-    }
-
-    memset(&req, 0, sizeof(req));
-    req.method = HTTP_POST;
-    req.url = path;
-    req.host = host;
-    req.protocol = "HTTP/1.1";
-    req.payload = http_work_item->data;
-    req.payload_len = strlen(http_work_item->data);
-    const char *headers = "Content-Type: application/json\r\n";
-    req.header_fields = headers;
-    req.response = http_response_cb;
-    req.recv_buf = recv_buf;
-    req.recv_buf_len = sizeof(recv_buf);
-
-    if (http_client_req(sock, &req, 5000, NULL) < 0) {
-        printk("HTTP client request failed\n");
-    }
-
-    close(sock);
-    freeaddrinfo(res);
-}
-
-
-static void http_client_work_handler_old(struct k_work *work)
-{
-    printk("Executing HTTP client work\n");
-    struct http_work *http_work_item = CONTAINER_OF(work, struct http_work, work);
-    struct http_request req;
-    static uint8_t recv_buf[512];
-    int sock;
-    struct addrinfo *res;
-    struct addrinfo hints = {
-        .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM,
-    };
-
-    // Basic URL parsing
-    char *host = http_work_item->url;
-    char *path = strchr(host, '/');
-    if (path) {
-        *path = 0;
-        path++;
-    } else {
-        path = "";
-    }
-
-    if (getaddrinfo(host, "80", &hints, &res) != 0) {
-        printk("Failed to resolve hostname: %s\n", host);
-        return;
-    }
-
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) {
-        printk("Failed to create socket\n");
-        freeaddrinfo(res);
-        return;
-    }
-
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        printk("Failed to connect to server\n");
-        close(sock);
-        freeaddrinfo(res);
-        return;
-    }
-
-    memset(&req, 0, sizeof(req));
-    req.method = HTTP_POST;
-    req.url = path;
-    req.host = host;
-    req.protocol = "HTTP/1.1";
-    req.payload = http_work_item->data;
-    req.payload_len = strlen(http_work_item->data);
-    const char *headers = "Content-Type: application/json\r\n";
-    req.header_fields = headers;
-    req.response = http_response_cb;
-    req.recv_buf = recv_buf;
-    req.recv_buf_len = sizeof(recv_buf);
-
-    if (http_client_req(sock, &req, 5000, NULL) < 0) {
-        printk("HTTP client request failed\n");
-    }
-
-    close(sock);
-    freeaddrinfo(res);
-}
-#endif
-
-// HTTP Trigger Handler
-#ifdef CONFIG_HTTP_CLIENT
-static void trigger_handler(const struct device *dev, const struct sensor_trigger *trig)
-{
-    //printk("Sensor interrupt triggered for %s\n", dev->name);
-    for (int i = 0; i < callback_count; i++) {
-        if (strcmp(callbacks[i].sensor_name, dev->name) == 0) {
-            struct http_work *new_work = k_malloc(sizeof(struct http_work));
-            if (new_work) {
-                k_work_init(&new_work->work, http_client_work_handler);
-                strcpy(new_work->url, callbacks[i].url);
-                snprintf(new_work->data, sizeof(new_work->data), "{\"sensor\":\"%s\",\"value\":\"triggered\"}", dev->name);
-                k_work_submit_to_queue(&http_work_q, &new_work->work);
-            }
-        }
-    }
-    if (sensor_sample_fetch(dev) < 0) {
-        printk("Failed to fetch sensor sample for %s\n", dev->name);
-        return;
-    }
-
-    // Re-enable the trigger
-}
-#endif
-
-// Example Button Pressed HTTP Callback Event
-#ifdef CONFIG_HTTP_CLIENT
-void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    printk("Button pressed\n");
-    for (int i = 0; i < callback_count; i++) {
-        if (strcmp(callbacks[i].sensor_name, "BUTTON0") == 0) {
-            struct http_work *new_work = k_malloc(sizeof(struct http_work));
-            if (new_work) {
-                k_work_init(&new_work->work, http_client_work_handler);
-                strcpy(new_work->url, callbacks[i].url);
-                snprintf(new_work->data, sizeof(new_work->data), "{\"button\":\"pressed\"}");
-                k_work_submit_to_queue(&http_work_q, &new_work->work);
-            }
-            return;
-        }
-    }
-}
-#endif
-
-// Connect Wifi passing ssid and password (todo add key)
-static int cmd_wifi_connect(const struct shell *shell, size_t argc, char **argv)
-{
-    if (argc < 3) {
-        shell_error(shell, "Usage: wifi_connect <ssid> <password>");
-        return -EINVAL;
-    }
-    wifi_params.ssid = (const uint8_t *)argv[1];
-    wifi_params.ssid_length = strlen(argv[1]);
-    wifi_params.psk = (const uint8_t *)argv[2];
-    wifi_params.psk_length = strlen(argv[2]);
-    wifi_params.security = WIFI_SECURITY_TYPE_PSK;
-    wifi_params.channel = WIFI_CHANNEL_ANY;
-
-    iface = net_if_get_default();
-    if (!iface) {
-        shell_error(shell, "Could not get default network interface");
-        return -ENODEV;
-    }
-
-    int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params, sizeof(struct wifi_connect_req_params));
-    if (ret) {
-        shell_error(shell, "Failed to connect to WiFi: %d", ret);
-    } else {
-        shell_print(shell, "Connecting to WiFi...");
-    }
-    return ret;
-}
-
-#ifdef CONFIG_HTTP_SERVER
-void http_server_thread_orig(void)
-{
-    printk("HTTP server thread started\n");
-    // Basic HTTP server implementation
-    while(1) {
-        k_msleep(1000); // Wait for init event
-        if (wifi_is_ready) {
-            break;
-        }
-    }
-
-    int serv_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(8081);
-    //addr.sin_addr.s_addr = inet_addr("192.168.3.35");
-    addr.sin_addr.s_addr = htonl(INADDR_ANY); // Listen on all interfaces
-
-    bind(serv_sock, (struct sockaddr *)&addr, sizeof(addr));
-    listen(serv_sock, 2);
-
-    while (1) {
-        int client_sock = accept(serv_sock, NULL, NULL);
-        if (client_sock < 0) {
-            k_sleep(K_SECONDS(1)); // Wait before retrying
-            continue;
-        }
-
-        char buf[256];
-        int len = recv(client_sock, buf, sizeof(buf) - 1, 0);
-        buf[len] = 0;
-
-        // Simple request parsing
-        if (strstr(buf, "GET /sensors/hts221")) {
-            struct sensor_value temp, hum;
-            sensor_sample_fetch(hts221);
-            sensor_channel_get(hts221, SENSOR_CHAN_AMBIENT_TEMP, &temp);
-            sensor_channel_get(hts221, SENSOR_CHAN_HUMIDITY, &hum);
-            snprintf(buf, sizeof(buf), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"temp\":%d.%06d, \"humidity\":%d.%06d}", temp.val1, temp.val2, hum.val1, hum.val2);
-        } else {
-            snprintf(buf, sizeof(buf), "HTTP/1.1 404 Not Found\r\n\r\n");
-        }
-
-        send(client_sock, buf, strlen(buf), 0);
-        close(client_sock);
-    }
-}
-#endif
-
-// Toggle LED 1
-static void cmd_toggle_led1 (const struct shell *shell, size_t argc, char **argv)
-{
-    if (gpio_pin_get_dt(&led1) > 0) {
-        gpio_pin_set_dt(&led1, 0);
-        shell_print(shell, "LED0 turned OFF");
-    } else {
-        gpio_pin_set_dt(&led1, 1);
-        shell_print(shell, "LED0 turned ON");
-    }
-}
-
-// Print contents of root dir (/lfs) to Shell
-static int cmd_ls (const struct shell *shell, size_t argc, char **argv) {
-    int rc;
-    struct fs_dir_t dir = {}; 
-    static struct fs_dirent entry;
-
-
-    rc = fs_opendir(&dir, "/lfs");
-    if (rc < 0) {
-        shell_error(shell, "Failed to open directory \"/\": %d", rc);
-        return rc;
-    }
-
-    while(1) {
-        rc = fs_readdir(&dir, &entry);
-        if (rc < 0) {
-            shell_error(shell, "Failed to read directory \"/\": %d", rc);
-            fs_closedir(&dir);
-            return rc;
-        } else if (rc == 0 && entry.name[0] == '\0') {
-            break; // No more entries
-        } else if (rc == 0) {
-            shell_print(shell, "%s", entry.name);
-        } else {
-            shell_print(shell, "Unexpected return value from fs_readdir: %d", rc);
-            break;
-        }
-    }
-    fs_closedir(&dir);
-}
-
-// Print contents of a file to Shell
-static int cmd_cat(const struct shell *shell, size_t argc, char **argv)
-{
-    struct fs_file_t file;
-    fs_file_t_init(&file);
-    int rc;
-    char * filepath = argv[1];
-
-    rc = fs_open(&file, filepath, FS_O_READ);
-    if (rc == -ENOENT) {
-        shell_print(shell, "File doesn't exist: %s", filepath);
-        return 0;
-    } else if (rc < 0) {
-        shell_error(shell, "Failed to open file %s: %d", filepath, rc);
-        return rc;
-    } else {
-        shell_print(shell, "Contents of %s:", filepath);
-        char buf[64];
-        while(1) { // reading 64 bytes at a time for now. maybe bigger later
-            int got = fs_read(&file, buf, sizeof(buf) - 1);
-            if (got < 0) { //error
-                shell_error(shell, "Failed to read file %s: %d", filepath, got);
-                fs_close(&file);
-                return got;
-            } else if (got == 0) {
-                break;
-            } 
-            buf[got] = '\0'; // null-terminate the string
-            //shell_print(shell, "%s", buf); 
-            shell_fprintf(shell, SHELL_NORMAL, "%s", buf);
-        }
-        fs_close(&file);
-        return 0;
-    }
-}
-
-void cmd_rm(const struct shell *shell, size_t argc, char **argv) {
-    if (argc < 2) {
-        shell_error(shell, "Usage: rm <file_name>");
-        return;
-    }
-    const char *file_name = argv[1];
-    int rc = fs_unlink(file_name);
-    if (rc < 0) {
-        shell_error(shell, "Failed to remove file %s: %d", file_name, rc);
-    } else {
-        shell_print(shell, "File %s removed successfully", file_name);
-    }
-}
-
-static void cmd_wifi_save (const struct shell *shell, size_t argc, char **argv){
-    struct fs_file_t file;
-    fs_file_t_init(&file);
-    int rc = fs_open(&file, WIFI_CONFIG_FILE, FS_O_CREATE | FS_O_WRITE);
-    if (rc < 0) {
-        printk("Failed to open WiFi config file: %d\n", rc);
-        return;
-    }
-
-    if (argc == 3) {
-        fs_write(&file, argv[1], strlen(argv[1]));
-        fs_write(&file, "\n", 1);
-        fs_write(&file, argv[2], strlen(argv[2]));
-        fs_write(&file, "\n", 1);
-        printk("WiFi credentials saved to %s\n", WIFI_CONFIG_FILE);
-    } else {
-        printk("No WiFi credentials to save.\n");
-    }
-    fs_close(&file);
-}
-
-static void cmd_wifi_reconnect(const struct shell *shell, size_t argc, char **argv) {
-    wifi_connect_to_saved_network();
-}
 
 struct sensor_save_work {
     struct k_work work;
@@ -512,16 +221,7 @@ struct sensor_save_work {
     char file_name[64]; // File name to save data
 };
 
-enum sensor_names {
-    HTS221,
-    LPS22HB,
-    LIS3MDL,
-    LSM6DSL,
-    VL53L0X,
-    BUTTON0
-};
 
-void sensor_timer_callback(struct k_timer *timer_id);
 
 static struct axes_list hts221_axes[] = {
     { .chan = SENSOR_CHAN_AMBIENT_TEMP, .name = "temperature" },
@@ -551,6 +251,9 @@ static struct axes_list vl53l0x_axes[] = {
     { .chan = SENSOR_CHAN_PROX, .name = "proximity" }
 };
 
+void sensor_timer_callback(struct k_timer *timer_id);
+
+// HTTP Client
 void sensor_timer_http_callback(struct k_timer *timer_id);
 
 struct sensor_info sensors[NUM_SENSORS] = {
@@ -609,9 +312,8 @@ struct sensor_info sensors[NUM_SENSORS] = {
 
     },
     {
-        // Button 0 as GPIO
         .dev_or_gpio = TYPE_GPIO,
-        .dev = NULL, // No device, just GPIO
+        .dev = NULL, 
         .gpio = &button0,
         .name = "button0",
         .timer_callback = sensor_timer_callback,
@@ -626,15 +328,125 @@ int get_sensor_index(char *sensor_name) {
             return i;
         }
     }
-    return -1; // Not found
+    return -1; 
 }
 
+static void http_client_work_handler(struct k_work *work);
+
+void int1_handler(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
+    //printk("INT1 triggered (step or free fall)\n");
+    switch (lsm6dsl_mode) {
+        case LSM6DSL_MODE_STEP:
+            uint8_t step_count_l, step_count_h;
+            lsm6dsl_read_reg(STEP_COUNTER_L, &step_count_l, 1);
+            lsm6dsl_read_reg(STEP_COUNTER_H, &step_count_h, 1);
+            uint16_t step_count = (step_count_h << 8) | step_count_l;
+            printk("Step count: %d\n", step_count);
+            break;
+
+        case LSM6DSL_MODE_TAP:
+            switch (lsm6dsl_action_mode) {
+                case MODE_FILE: {
+                    // Write tap data to file
+                    struct sensor_info *sensor = &sensors[LSM6DSL];
+                    k_work_submit(&sensor->interrupt_work);
+                    printk("Tap data written to file\n");
+                }
+                break;
+
+                case MODE_HTTP: {
+                    // Send tap data via HTTP
+                    struct sensor_info *sensor = &sensors[LSM6DSL];
+                    k_work_submit(&sensor->interrupt_http_work);
+                    printk("Tap data written to file\n");
+                }
+                break;
+
+                default:
+                    printk("No action for current mode\n");
+            }
+            break;
+
+        default:
+            //printk("No action for current mode\n");
+    }
+}
+
+
+// Sensor Reading command
+static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv);
+
+// EXPERIMENTAL
+#ifdef CONFIG_HTTP_SERVER
+void http_server_thread_orig(void)
+{
+    printk("HTTP server thread started\n");
+    // Basic HTTP server implementation
+    while(1) {
+        k_msleep(1000); // Wait for init event
+        if (wifi_is_ready) {
+            break;
+        }
+    }
+
+    int serv_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(8081);
+    //addr.sin_addr.s_addr = inet_addr("192.168.3.35");
+    addr.sin_addr.s_addr = htonl(INADDR_ANY); // Listen on all interfaces
+
+    bind(serv_sock, (struct sockaddr *)&addr, sizeof(addr));
+    listen(serv_sock, 2);
+
+    while (1) {
+        int client_sock = accept(serv_sock, NULL, NULL);
+        if (client_sock < 0) {
+            k_sleep(K_SECONDS(1)); // Wait before retrying
+            continue;
+        }
+
+        char buf[256];
+        int len = recv(client_sock, buf, sizeof(buf) - 1, 0);
+        buf[len] = 0;
+
+        // Simple request parsing
+        if (strstr(buf, "GET /sensors/hts221")) {
+            struct sensor_value temp, hum;
+            sensor_sample_fetch(hts221);
+            sensor_channel_get(hts221, SENSOR_CHAN_AMBIENT_TEMP, &temp);
+            sensor_channel_get(hts221, SENSOR_CHAN_HUMIDITY, &hum);
+            snprintf(buf, sizeof(buf), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"temp\":%d.%06d, \"humidity\":%d.%06d}", temp.val1, temp.val2, hum.val1, hum.val2);
+        } else {
+            snprintf(buf, sizeof(buf), "HTTP/1.1 404 Not Found\r\n\r\n");
+        }
+
+        send(client_sock, buf, strlen(buf), 0);
+        close(client_sock);
+    }
+}
+#endif
+
+// Toggle LED 1 command
+static void cmd_toggle_led1 (const struct shell *shell, size_t argc, char **argv)
+{
+    if (gpio_pin_get_dt(&led1) > 0) {
+        gpio_pin_set_dt(&led1, 0);
+        shell_print(shell, "LED0 turned OFF");
+    } else {
+        gpio_pin_set_dt(&led1, 1);
+        shell_print(shell, "LED0 turned ON");
+    }
+}
+
+// Work Handlers
 void http_client_work_handler(struct k_work *work) {
     struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, http_work);
 
-    char buf[128];           // Larger buffer to ensure full string fits
+    char buf[128];           
     struct http_request req;
-    static uint8_t recv_buf[512];
+    //static uint8_t recv_buf[512];
     int sock;
     struct addrinfo *res;
     struct addrinfo hints = {
@@ -671,58 +483,15 @@ void http_client_work_handler(struct k_work *work) {
     if (getaddrinfo(host, "80", &hints, &res) != 0) {
         printk("Failed to resolve hostname: %s\n", host);
         return;
-    }/**/
-/*
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) {
-        printk("Failed to create socket\n");
-        freeaddrinfo(res);
-        return;
     }
-
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        printk("Failed to connect to server\n");
-        close(sock);
-        freeaddrinfo(res);
-        return;
-    }*/
     
-    struct sockaddr_in addr = {0};
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);
-    //inet_pton(AF_INET, "192.168.3.14", &addr.sin_addr);
-    
-    //inet_pton(AF_INET, host, &addr.sin_addr);
-    addr.sin_addr = *((struct in_addr *)res->ai_addr->data + 2); // Copy the resolved address
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    connect(sock, (struct sockaddr *)res->ai_addr, sizeof(res->ai_addr));
     char _buf[256]; // Buffer for the HTTP request
     char * msg_template = "POST /%s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s";
     snprintf(_buf, sizeof(_buf), msg_template, path, host, len, buf);
     write(sock, _buf, strlen(_buf));
     close(sock);
-
-    /*memset(&req, 0, sizeof(req));
-    req.method = HTTP_POST;
-    req.url = path;
-    req.host = host;
-    req.protocol = "HTTP/1.1";
-    req.payload = buf;
-    req.payload_len = strlen(buf);
-    static const char *headers = "Content-Type: application/json\r\n";
-    req.header_fields = headers;
-    req.response = http_response_cb;
-    req.recv_buf = recv_buf;
-    req.recv_buf_len = sizeof(recv_buf);
-
-
-    if (http_client_req(sock, &req, 5000, NULL) < 0) {
-        printk("HTTP client request failed\n");
-    }
-
-    close(sock);*/
-    //freeaddrinfo(res);
 }
 
 void sensor_work_handler(struct k_work *work) {
@@ -750,20 +519,60 @@ void sensor_work_handler(struct k_work *work) {
     fs_file_t_init(&file);
     ret = fs_open(&file, full_path, FS_O_CREATE | FS_O_APPEND);
     if (ret < 0) {
-        printk("Failed to open file: %s\n", full_path);
         return;
     }
 
-    //fs_seek(&file, 0, FS_SEEK_END);
     ret = fs_write(&file, buf, len);
     if (ret < 0) {
-        printk("Failed to write to file: %d\n", ret);
     }
-
     printk("Writing to file %s->%s<-END\n", full_path, buf);
     fs_close(&file);
 }
 
+void interrupt_work_handler(struct k_work *work) {
+    //struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, interrupt_work);
+    struct sensor_info *sensor = &sensors[LSM6DSL];
+    printk("Interrupt work handler for sensor %s\n", sensor->name);
+    char full_path[128];
+    snprintf(full_path, sizeof(full_path), "/lfs/%s", sensor->interrupt_cb_filename);
+    struct fs_file_t file;
+    fs_file_t_init(&file);
+    int ret = fs_open(&file, full_path, FS_O_CREATE | FS_O_APPEND);
+    if (ret < 0) {
+        printk("Failed to open file %s: %d\n", full_path, ret);
+        return;
+    }
+    // Write the interrupt data to the file
+    char buf[128];
+    ret = sensor_reading(sensor->name, buf, sizeof(buf));
+    if (ret < 0) {
+        printk("Sensor read failed: %d\n", ret);
+        fs_close(&file);
+        return;
+    }
+    // Make sure the result is a full line
+    size_t len = strlen(buf);
+    if (len < sizeof(buf) - 1) {
+        buf[len] = '\0';
+    }
+    ret = fs_write(&file, buf, len);
+    if (ret < 0) {
+        printk("Failed to write to file %s: %d\n", full_path, ret);
+        fs_close(&file);
+        return;
+    }
+    printk("Sensor %s interrupt data: %s\n", sensor->name, buf);
+    fs_close(&file);
+}
+
+void interrupt_http_work_handler(struct k_work *work) {
+    //struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, interrupt_work);
+    struct sensor_info *sensor = &sensors[LSM6DSL];
+    printk("Interrupt http work handler for sensor %s\n", sensor->name);
+    
+}
+
+// Timer Callbacks
 void sensor_timer_callback(struct k_timer *timer_id) {
     struct sensor_info *sensor = CONTAINER_OF(timer_id, struct sensor_info, timer);
     k_work_submit(&sensor->work);
@@ -774,6 +583,7 @@ void sensor_timer_http_callback(struct k_timer *timer_id) {
     k_work_submit(&sensor->http_work);
 }
 
+// Sensor Timer HTTP Stop Command
 static void cmd_sensor_timer_http_stop (const struct shell *shell, size_t argc, char **argv) {
     if (argc < 2) {
         shell_error(shell, "Usage: sensor_timer_stop <sensor_name>");
@@ -787,6 +597,7 @@ static void cmd_sensor_timer_http_stop (const struct shell *shell, size_t argc, 
     shell_print(shell, "Stopped timer for %s", sensor_name);
 }
 
+// Sensor Timer HTTP Start Command
 static void cmd_sensor_timer_http_start (const struct shell *shell, size_t argc, char **argv){
     if (argc < 3) {
         shell_error(shell, "Usage: sensor_timer_cb <sensor_name> <url> <timing>");
@@ -805,6 +616,7 @@ static void cmd_sensor_timer_http_start (const struct shell *shell, size_t argc,
     k_timer_start(&(sensor->http_timer), K_SECONDS(time), K_SECONDS(time));
 }
 
+// Sensor Timer Start Command
 static void cmd_sensor_timer_start(const struct shell *shell, size_t argc, char **argv){
     if (argc < 3) {
         shell_error(shell, "Usage: sensor_timer <sensor_name> <file_name> <timing>");
@@ -823,6 +635,166 @@ static void cmd_sensor_timer_start(const struct shell *shell, size_t argc, char 
     k_timer_start(&(sensor->timer), K_SECONDS(time), K_SECONDS(time));
 }
 
+void enable_tap_sensor() {
+    uint8_t val;
+    int32_t ret;
+    
+    ret = lsm6dsl_read_reg(CTRL1_XL, &val, 1); // CRTL1_XL
+    printk("CTRL1_XL: %02x\n", val);
+    val = 0x60;
+    ret = lsm6dsl_write_reg(CTRL1_XL, &val, 1);
+    
+    ret = lsm6dsl_read_reg(TAP_CFG, &val, 1); // TAP_CFG
+    printk("TAP_CFG: %02x\n", val);
+    val = 0x8e;
+    ret = lsm6dsl_write_reg(TAP_CFG, &val, 1);
+
+    ret = lsm6dsl_read_reg(TAP_THS_6D, &val, 1); // TAP_THS_6D
+    printk("TAP_THS_6D: %02x\n", val); 
+    val = 0x8c;
+    ret = lsm6dsl_write_reg(TAP_THS_6D, &val, 1);
+
+    ret = lsm6dsl_read_reg(INT_DUR2, &val, 1); // INT_DUR2
+    printk("INT_DUR2: %02x\n", val);
+    val = 0x7f; // Set duration for tap detection
+    ret = lsm6dsl_write_reg(INT_DUR2, &val, 1);
+
+    ret = lsm6dsl_read_reg(WAKE_UP_THS, &val, 1); // WAKE_UP_THS
+    printk("WAKE_UP_THS: %02x\n", val);
+    val = 0x80; // Set wake-up threshold
+    ret = lsm6dsl_write_reg(WAKE_UP_THS, &val, 1); // Set wake-up threshold
+
+    ret = lsm6dsl_read_reg(MD1_CFG, &val, 1);
+    printk("MD1_CFG: %02x\n", val);
+    val = 0x08;
+    ret = lsm6dsl_write_reg(MD1_CFG, &val, 1); //MD1_CFG
+    
+    ret = lsm6dsl_read_reg(INT1_CTRL, &val, 1);
+    printk("INT1_CTRL: %02x\n", val);
+    val = 0x80; // Set wake-up threshold
+    ret = lsm6dsl_write_reg(INT1_CTRL, &val, 1); 
+}
+
+void enable_single_tap_sensor() {
+    uint8_t val;
+    int32_t ret;
+    
+    ret = lsm6dsl_read_reg(CTRL1_XL, &val, 1); // CRTL1_XL
+    printk("CTRL1_XL: %02x\n", val);
+    val = 0x60;
+    ret = lsm6dsl_write_reg(CTRL1_XL, &val, 1);
+    
+    ret = lsm6dsl_read_reg(TAP_CFG, &val, 1); // TAP_CFG
+    printk("TAP_CFG: %02x\n", val);
+    val = 0x8e;
+    ret = lsm6dsl_write_reg(TAP_CFG, &val, 1);
+
+    ret = lsm6dsl_read_reg(TAP_THS_6D, &val, 1); // TAP_THS_6D
+    printk("TAP_THS_6D: %02x\n", val); 
+    val = 0x89;
+    ret = lsm6dsl_write_reg(TAP_THS_6D, &val, 1);
+
+    ret = lsm6dsl_read_reg(INT_DUR2, &val, 1); // INT_DUR2
+    printk("INT_DUR2: %02x\n", val);
+    val = 0x06; // Set duration for tap detection
+    ret = lsm6dsl_write_reg(INT_DUR2, &val, 1);
+
+    ret = lsm6dsl_read_reg(WAKE_UP_THS, &val, 1); // WAKE_UP_THS
+    printk("WAKE_UP_THS: %02x\n", val);
+    val = 0x00; // Set wake-up threshold
+    ret = lsm6dsl_write_reg(WAKE_UP_THS, &val, 1); // Set wake-up threshold
+
+    ret = lsm6dsl_read_reg(MD1_CFG, &val, 1);
+    printk("MD1_CFG: %02x\n", val);
+    val = 0x40;
+    ret = lsm6dsl_write_reg(MD1_CFG, &val, 1); //MD1_CFG
+
+        ret = lsm6dsl_read_reg(INT1_CTRL, &val, 1);
+    printk("INT1_CTRL: %02x\n", val);
+    val = 0x80; // Set wake-up threshold
+    ret = lsm6dsl_write_reg(INT1_CTRL, &val, 1); 
+}
+
+void enable_step_sensor() {
+    uint8_t val;
+    int32_t ret;
+
+    ret = lsm6dsl_read_reg(FUNC_CFG_ACCESS, &val, 1); // CRTL1_XL
+    printk("CTRL1_XL: %02x\n", val);
+    val = 0x80; // Set accelerometer to 104 Hz
+    ret = lsm6dsl_write_reg(FUNC_CFG_ACCESS, &val, 1);
+
+    ret = lsm6dsl_read_reg(CONFIG_PEDO_THS_MIN, &val, 1); // CRTL1_XL
+    printk("CONFIG_PEDO_THS_MIN: %02x\n", val);
+    val = 0x8E; // Set accelerometer to 104 Hz
+    ret = lsm6dsl_write_reg(CONFIG_PEDO_THS_MIN, &val, 1);
+
+    ret = lsm6dsl_read_reg(FUNC_CFG_ACCESS, &val, 1); // CRTL1_XL
+    printk("FUNC_CFG_ACCESS: %02x\n", val);
+    val = 0x00; // Set accelerometer to 104 Hz
+    ret = lsm6dsl_write_reg(FUNC_CFG_ACCESS, &val, 1);
+
+    ret = lsm6dsl_read_reg(CTRL1_XL, &val, 1); // CRTL1_XL
+    printk("CTRL1_XL: %02x\n", val);
+    val = 0x28; // Set accelerometer to 104 Hz
+    ret = lsm6dsl_write_reg(CTRL1_XL, &val, 1);
+
+    ret = lsm6dsl_read_reg(CTRL10_C, &val, 1); // CRTL1_XL
+    printk("CTRL10_C: %02x\n", val);
+    val = 0x14; // Set accelerometer to 104 Hz
+    ret = lsm6dsl_write_reg(CTRL10_C, &val, 1);
+
+    ret = lsm6dsl_read_reg(INT1_CTRL, &val, 1); // CRTL1_XL
+    printk("INT1_CTRL: %02x\n", val);
+    val = 0x80; // Set accelerometer to 104 Hz
+    ret = lsm6dsl_write_reg(INT1_CTRL, &val, 1);
+}
+
+static void cmd_lsm6dsl_tap_http_start(const struct shell *shell, size_t argc, char **argv) {
+    if (argc < 2) {
+        shell_error(shell, "Usage: lsm6dsl_tap_http_start <url>");
+        return;
+    }
+    sensors[LSM6DSL].interrupt_url = argv[1];
+
+    enable_single_tap_sensor();
+    lsm6dsl_mode = LSM6DSL_MODE_TAP;
+    lsm6dsl_action_mode = MODE_HTTP;
+
+    shell_print(shell, "Started LSM6DSL tap detection with HTTP mode");
+}
+
+static void cmd_lsm6dsl_tap_start(const struct shell *shell, size_t argc, char **argv) {
+    if (argc < 2) {
+        shell_error(shell, "Usage: lsm6dsl_step_start <filename>");
+        return;
+    }
+    sensors[LSM6DSL].interrupt_cb_filename = argv[1];
+
+    enable_single_tap_sensor();
+    lsm6dsl_mode = LSM6DSL_MODE_TAP;
+    lsm6dsl_action_mode = MODE_FILE;
+}
+
+static void cmd_lsm6dsl_step_start(const struct shell *shell, size_t argc, char **argv) {
+   if (argc < 2) {
+        shell_error(shell, "Usage: lsm6dsl_step_start <filename>");
+        return;
+    }
+    sensors[LSM6DSL].interrupt_cb_filename = argv[1];
+
+    enable_step_sensor();
+    lsm6dsl_mode = LSM6DSL_MODE_STEP;
+    lsm6dsl_action_mode = MODE_FILE;    
+}
+
+static void cmd_lsm6dsl_step_stop(const struct shell *shell, size_t argc, char **argv) {
+    // Stop the LSM6DSL step detection timer
+    //k_timer_stop(&sensors[LSM6DSL].timer);
+    shell_print(shell, "Stopped LSM6DSL step detection");
+}
+
+// Sensor Timer Stop Command
 static void cmd_sensor_timer_stop (const struct shell *shell, size_t argc, char **argv) {
     if (argc < 2) {
         shell_error(shell, "Usage: sensor_timer_stop <sensor_name>");
@@ -836,6 +808,7 @@ static void cmd_sensor_timer_stop (const struct shell *shell, size_t argc, char 
     shell_print(shell, "Stopped timer for %s", sensor_name);
 }
 
+// Sensor Reading (Returns formatted string of sensor data)
 // TODO we should use the sensors struct instead of hardcoding
 int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
 {
@@ -914,8 +887,8 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
         sensor_channel_get(vl53l0x, SENSOR_CHAN_DISTANCE, &val[0]);
 
         used = snprintf(buf, buf_len,
-                        "VL53L0X: Distance %d mm\n",
-                        val[0].val1);
+                        "VL53L0X: Raw Distance %d\n",
+                        val[0].val2);
     }
 
     else if (strcmp(sensor_name, "button0") == 0) {
@@ -932,7 +905,6 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
                         "Unknown sensor: %s\n", sensor_name);
     }
 
-    /* Enforce null termination and check for truncation */
     buf[buf_len - 1] = '\0';
     if (used >= (int)buf_len) {
         return -ENOSPC;
@@ -941,6 +913,7 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
     return used;
 }
 
+// Use sensor_reading to read a sensor and print the result
 static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv)
 {
     if (argc < 2) {
@@ -963,15 +936,7 @@ static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv)
 }
 
 SHELL_CMD_REGISTER(read, NULL, "Read sensor data", cmd_read_sensor);
-SHELL_CMD_REGISTER(wifi_connect, NULL, "Connect to WiFi", cmd_wifi_connect);
 SHELL_CMD_REGISTER(toggle_led1, NULL, "Toggle LED1", cmd_toggle_led1);
-
-SHELL_CMD_REGISTER(ls, NULL, "List items on FS", cmd_ls);
-SHELL_CMD_REGISTER(cat, NULL, "Display contents of a file", cmd_cat);
-SHELL_CMD_REGISTER(rm, NULL, "Remove a file", cmd_rm);
-
-SHELL_CMD_REGISTER(wifi_save, NULL, "Save WiFi credentials to file", cmd_wifi_save);
-SHELL_CMD_REGISTER(wifi_reconnect, NULL, "Reconnect to saved WiFi network", cmd_wifi_reconnect);
 
 SHELL_CMD_REGISTER(sensor_timer_start, NULL, "Start sensor timer", cmd_sensor_timer_start);
 SHELL_CMD_REGISTER(sensor_timer_stop, NULL, "Stop sensor timer", cmd_sensor_timer_stop);
@@ -979,101 +944,10 @@ SHELL_CMD_REGISTER(sensor_timer_stop, NULL, "Stop sensor timer", cmd_sensor_time
 SHELL_CMD_REGISTER(sensor_timer_http_start, NULL, "Start sensor HTTP timer", cmd_sensor_timer_http_start);
 SHELL_CMD_REGISTER(sensor_timer_http_stop, NULL, "Stop sensor HTTP timer", cmd_sensor_timer_http_stop);
 
-// TESTING
-//SHELL_CMD_REGISTER(schedule, NULL, "Schedule a sensor reading", cmd_schedule_reading);
-//SHELL_CMD_REGISTER(register_callback, NULL, "Register a REST callback for a sensor", cmd_register_callback);
-//K_THREAD_DEFINE(scheduler, 2048, scheduler_thread, NULL, NULL, NULL, 7, 0, 0);
-
-// Handle DHCP assigning IP (set state variable)
-static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb, uint32_t mgmt_event, struct net_if *iface)
-{
-    if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
-        char buf[NET_IPV4_ADDR_LEN];
-        wifi_is_ready = true; 
-        //printk("IPv4 address: %s\n", net_addr_ntop(AF_INET, &iface->config.ip.ipv4->unicast[0].address.in_addr, buf, sizeof(buf)));
-    }
-
-}
-
-void read_wifi_config() {
-    struct fs_file_t file;
-    fs_file_t_init(&file);
-    int rc = fs_open(&file, WIFI_CONFIG_FILE, FS_O_READ);
-    if (rc < 0) {
-        printk("Failed to open WiFi config file: %d\n", rc);
-        return;
-    }
-
-    char _ssid[128];
-    char _password[128];
-    
-    uint8_t _ssid_len;
-    uint8_t _password_len;
-
-    char buf[64];
-    char * b = &buf;
-    int len = 0;
-    bool next = false;
-    while ((len = fs_read(&file, b, 1)) > 0) {
-        if (*b == '\n') {
-            *b = '\0'; // Null-terminate the string
-            if (!next) {
-                _ssid_len = strlen(buf);
-                if (_ssid_len > 0) {
-                    strncpy(_ssid, buf, sizeof(_ssid) - 1);
-                    _ssid[_ssid_len] = '\0';
-                    next = true;
-                    b = &buf[0]; // Reset buffer pointer
-                    continue;
-                }
-            } else {
-                _password_len = strlen(buf);
-                if (_password_len > 0) {
-                    strncpy(_password, buf, sizeof(_password) - 1);
-                    _password[_password_len] = '\0';
-                }
-                break; 
-            }
-        }
-        b++;
-
-    }
-    ssid = k_malloc(_ssid_len + 1);
-    password = k_malloc(_password_len + 1);
-    strcpy(ssid, _ssid);
-    strcpy(password, _password);
-    fs_close(&file);
-    return; 
-}
-
-void wifi_connect_to_saved_network() {
-    read_wifi_config();
-    if (ssid && password) {
-        wifi_params.ssid = (const uint8_t *)ssid;
-        wifi_params.ssid_length = strlen(ssid);
-        wifi_params.psk = (const uint8_t *)password;
-        wifi_params.psk_length = strlen(password);
-        wifi_params.security = WIFI_SECURITY_TYPE_PSK;
-        wifi_params.channel = WIFI_CHANNEL_ANY;
-
-        iface = net_if_get_default();
-        if (!iface) {
-            //shell_error(shell, "Could not get default network interface");
-            return -ENODEV;
-        }
-
-        int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params, sizeof(struct wifi_connect_req_params));
-        if (ret) {
-            //shell_error(shell, "Failed to connect to WiFi: %d", ret);
-        } else {
-            //shell_print(shell, "Connecting to WiFi...");
-        }
-        return;
-        //return ret;
-    } else {
-        printk("No saved WiFi credentials found.\n");
-    }
-}
+SHELL_CMD_REGISTER(lsm6dsl_step_start, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_step_start);
+SHELL_CMD_REGISTER(lsm6dsl_tap_start, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_tap_start);
+SHELL_CMD_REGISTER(lsm6dsl_tap_http_start, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_tap_http_start);
+SHELL_CMD_REGISTER(lsm6dsl_step_stop, NULL, "Stop LSM6DSL event handler", cmd_lsm6dsl_step_stop);
 
 void init_sensors() {
     for (int i = 0; i < NUM_SENSORS; i++) {
@@ -1095,8 +969,20 @@ void init_sensors() {
         k_timer_init(&sensors[i].timer, sensors[i].timer_callback, NULL);
         k_work_init(&sensors[i].work, sensor_work_handler);
         k_work_init(&sensors[i].http_work, http_client_work_handler);
+        k_work_init(&sensors[i].interrupt_work, interrupt_work_handler);
+        k_work_init(&sensors[i].interrupt_http_work, interrupt_http_work_handler);
         sensors[i].cb_filename = k_malloc(64);
         sensors[i].url = k_malloc(128);
+        struct sensor_value odr_attr;
+        odr_attr.val1 = 104; // Set ODR to 100 Hz
+        odr_attr.val2 = 0;
+
+        if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_ACCEL_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
+            printk("Failed to set LSM6DSL ODR\n");
+        }
+        if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
+            printk("Failed to set LSM6DSL Gyro ODR\n");
+        }
     }
 }
 
@@ -1111,12 +997,6 @@ void main(void)
     gpio_pin_configure_dt(&button0, GPIO_INPUT);
     gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_TO_ACTIVE);
     
-    #ifdef CONFIG_HTTP_CLIENT
-    // Setup Button HTTP Callback for testing (disable later)
-    gpio_init_callback(&button_cb_data, button_pressed, BIT(button0.pin));
-    gpio_add_callback(button0.port, &button_cb_data);
-    #endif
-
     printk("LEDs and button initialized\n");
 
     // Initialize Filesystem
@@ -1134,27 +1014,31 @@ void main(void)
     printk("WiFi initialized\n");
     wifi_connect_to_saved_network();
 
-    // Initialize Work Queue
-    #ifdef CONFIG_HTTP_CLIENT
-    printk("Initializing work queue...\n");
-    k_work_queue_start(&http_work_q, http_work_q_stack, K_THREAD_STACK_SIZEOF(http_work_q_stack), K_PRIO_COOP(7), NULL);
-    printk("Work queue initialized\n");
-    #endif
-
     // Initialize Sensors and Triggers
     init_sensors();
 
-    struct sensor_value odr_attr;
-    odr_attr.val1 = 1; // Set ODR to 100 Hz
-    odr_attr.val2 = 0;
+    // INTERRUPTS
+    int ret = gpio_pin_configure_dt(&int1_gpio, GPIO_INPUT | GPIO_INT_EDGE_RISING);
+    if (ret != 0) {
+        printk("Failed to configure INT1 GPIO: %d\n", ret);
+        return -1;
+    }
+    gpio_init_callback(&gpio_cb, int1_handler, BIT(int1_gpio.pin));
+    ret = gpio_add_callback(int1_gpio.port, &gpio_cb);
+    if (ret != 0) {
+        printk("Failed to add GPIO callback: %d\n", ret);
+        return -1;
+    }
 
-    if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_ACCEL_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
-        printk("Failed to set LSM6DSL ODR\n");
+    ret = gpio_pin_interrupt_configure_dt(&int1_gpio, GPIO_INT_EDGE_RISING);
+    if (ret != 0) {
+        printk("Failed to enable INT1 interrupt: %d\n", ret);
+        return -1;
     }
-    if (sensor_attr_set(lsm6dsl, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
-        printk("Failed to set LSM6DSL Gyro ODR\n");
-    }
-    
+
+    printk("INT1 interrupt configured on GPIOD pin %d\n", int1_gpio.pin);
+    // INTERRUPTS
+
     printk("System Initialized. Entering main loop.\n");
 
     while (1) {
