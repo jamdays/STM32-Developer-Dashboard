@@ -19,3 +19,7 @@ def api_process_command():
 
     response = process_command(command, timeout_val=timeout_val)
     return jsonify({'response': response})
+
+@bp.route('/startup', methods=['GET'])
+def api_startup():
+    return jsonify({'response': get_opening()})

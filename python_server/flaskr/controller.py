@@ -7,20 +7,22 @@ import glob
 import re
 
 opening = r"""
-   _____ _______ __  __ ____ ___    _____               _____            _     _                         _                  
-  / ____|__   __|  \/  |___ \__ \  |  __ \             |  __ \          | |   | |                       | |                 
- | (___    | |  | \  / | __) | ) | | |  | | _____   __ | |  | | __ _ ___| |__ | |__   ___   __ _ _ __ __| |                 
-  \___ \   | |  | |\/| ||__ < / /  | |  | |/ _ \ \ / / | |  | |/ _` / __| '_ \| '_ \ / _ \ / _` | '__/ _` |                 
-  ____) |  | |  | |  | |___) / /_  | |__| |  __/\ V /  | |__| | (_| \__ \ | | | |_) | (_) | (_| | | | (_| |                 
- |_____/   |_|_ |_|  |_|____/____| |_____/_\___| \_/   |_____/ \__,_|___/_| |_|_.__/_\___/ \__,_|_|  \__,_|__               
- |  __ \     | | | |                 |__   __|                (_)           | | |_   _|     | |           / _|              
- | |__) |   _| |_| |__   ___  _ __      | | ___ _ __ _ __ ___  _ _ __   __ _| |   | |  _ __ | |_ ___ _ __| |_ __ _  ___ ___ 
- |  ___/ | | | __| '_ \ / _ \| '_ \     | |/ _ \ '__| '_ ` _ \| | '_ \ / _` | |   | | | '_ \| __/ _ \ '__|  _/ _` |/ __/ _ \
- | |   | |_| | |_| | | | (_) | | | |    | |  __/ |  | | | | | | | | | | (_| | |  _| |_| | | | ||  __/ |  | || (_| | (_|  __/
- |_|    \__, |\__|_| |_|\___/|_| |_|    |_|\___|_|  |_| |_| |_|_|_| |_|\__,_|_| |_____|_| |_|\__\___|_|  |_| \__,_|\___\___|
-         __/ |                                                                                                              
-        |___/                                                                                                               
+ ____ ____ ____ ____ ____ _________ ____ ____ ____ 
+||S |||T |||M |||3 |||2 |||       |||D |||e |||v ||
+||__|||__|||__|||__|||__|||_______|||__|||__|||__||
+|/__\|/__\|/__\|/__\|/__\|/_______\|/__\|/__\|/__\|
+ ____ ____ ____ ____ ____ ____ ____ ____ ____      
+||D |||a |||s |||h |||b |||o |||a |||r |||d ||     
+||__|||__|||__|||__|||__|||__|||__|||__|||__||     
+|/__\|/__\|/__\|/__\|/__\|/__\|/__\|/__\|/__\|            
+Welcome to the STM32 Developer Dashboard!
+This is a Python terminal interface for the STM32 Discovery Board.
+Type 'term_help' for help related to the Python terminal interface.
+Type 'help' for help related to the Discovery Board.                                                                                    
         """
+
+def get_opening():
+    return opening
 
 # Configuration
 def find_serial_port():
@@ -86,16 +88,14 @@ def send_command(command, timeout_val=0.3):
 
 def process_command(command, timeout_val=0.3):
     """Process a single command and return the response."""
-    if command.lower() == 'exit':
-        return "Exiting..."
-    elif command.lower() == 'term_help':
+    if command.lower() == 'term_help':
         return (
             "Python terminal commands:\n"
-            "  - 'exit': Exit the terminal\n"
             "  - 'help': Get help related to the Discovery Board\n"
             "  - 'term_help': Get help related to the Python terminal interface\n"
             "  - 'set_timeout <seconds>': Set the timeout for serial commands (default is 0.3 seconds)\n"
-            "  - 'os_do <command>': Execute a shell command on the host system"
+            "  - 'os_do <command>': Execute a shell command on the host system\n"
+            "  - 'clear': Clear the terminal output\n"
         )
     elif command.lower().startswith('set_timeout '):
         try:

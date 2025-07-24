@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState, useRef } from "react";
+import { start } from "repl";
 
 export default function Home() {
   const [command, setCommand] = useState(""); // Stores the current command input
@@ -9,14 +10,42 @@ export default function Home() {
 
   const outputRef = useRef<HTMLDivElement>(null); // Ref to track the output container
 
+  const localCommands = ["clear", "ping"]; // List of local commands that don't require API calls
+
+  const startupScreen = async () => {
+    try {
+      const response = await fetch(`${flaskUrl}/startup`);
+      if (!response.ok) {
+        throw new Error("Failed to fetch startup screen");
+      }
+      const data = await response.json();
+      console.log("Startup screen data:", data);
+      const responseArray = data.response.split("\n").map((line) => line.trim());
+      setOutput(responseArray);
+    } catch (error) {
+      console.error("Error fetching startup screen:", error);
+    }
+  }
+
+  useEffect(() => {
+    startupScreen();
+  }, []); // Fetch the startup screen when the component mounts
+
   const handleCommandSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    handleCommandLocal(command);
+
+    if (localCommands.includes(command)) {
+      return;
+    }
 
     if (!command.trim()) return;
 
     // Add the command to the output
-    setOutput((prev) => [...prev, `> ${command}`]);
+    setOutput((prev) => [...prev, `> ${command}`]);    
 
+    console.log("command is ", command);
     try {
       // Send the command to the API
       const response = await fetch(`${flaskUrl}/process_command`, {
@@ -49,6 +78,20 @@ export default function Home() {
       outputRef.current.scrollTop = outputRef.current.scrollHeight;
     }
   }, [output]);
+
+  function handleCommandLocal(command: string) {
+    if (!command.trim()) return;
+    if (command === "clear") {
+      setOutput([]);
+    } else if (command === "ping") {
+      setTimeout(() => {
+        setOutput((prev) => [...prev, "pong"]);
+      }, 100);
+    } else {
+      return;
+    }
+    setCommand("");
+  }
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-black text-white font-mono p-4">
