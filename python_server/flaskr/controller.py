@@ -72,11 +72,14 @@ def send_command(command, timeout_val=0.3):
             # Read and print response
             print("Board output:")
             start_time = time.time()
+            response = ""
             while time.time() - start_time < timeout_val:  # read for timeout seconds
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 line = filter_line(line, command)
                 if line:
+                    response += line + "\n"
                     print(line)
+            return response
 
     except serial.SerialException as e:
         print(f"Serial error: {e}")
@@ -108,8 +111,8 @@ def process_command(command, timeout_val=0.3):
             return f"Error executing OS command: {e}"
     else:
         # Send the command to the board
-        send_command(command, timeout_val=timeout_val)
-        return f"Command '{command}' sent to the board."
+        response = send_command(command, timeout_val=timeout_val)
+        return response
 
 def terminal():
     timeout_val = 0.3  # Default timeout value
