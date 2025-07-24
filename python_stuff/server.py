@@ -6,9 +6,23 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from micromlgen import port
+import glob
+import re
 
 # Configuration
-SERIAL_PORT = '/dev/ttyACM0'  # Adjust for your macOS port (e.g., /dev/cu.usbmodemXXXX)
+def find_serial_port():
+    ports = glob.glob('/dev/cu.usbmodem*')
+    if not ports:
+        print("No serial ports found. Ensure the board is connected.")
+        sys.exit()
+    elif len(ports) > 1:
+        print(f"Multiple serial ports have been found. The first one has been selected: {ports[0]}")
+    else:
+        print(f"Serial port found: {ports[0]}")
+    return ports[0]
+
+# SERIAL_PORT = '/dev/cu.usbmodem103'  # Adjust for your macOS port (e.g., /dev/cu.usbmodemXXXX)
+SERIAL_PORT = find_serial_port()
 BAUD_RATE = 115200
 DATA_DIR = 'motion_data'
 GESTURES = ['up-down', 'shake', 'wave', 'circle', 'tap', 'twist', 'figure-eight']
@@ -21,134 +35,71 @@ FEATURES = [
     'corr_gx_gy', 'corr_gx_gz', 'corr_gy_gz'
 ]
 
-def collect_data(gesture):
-    """Collect accelerometer and gyroscope data for a specific gesture."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    filename = f"{DATA_DIR}/{gesture}_{int(time.time())}.csv"
-    print(f"Collecting data for {gesture}. Move the board now...")
-    
-    data = []
+
+def filter_line(line, command_sent):
+    ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    filter = ['<dbg>', '<wrn>', 'uart:~$']
+    if any(f in line for f in filter):
+        return None
+    if command_sent.strip() == line.strip():
+        return None
+    return ANSI_ESCAPE.sub('', line)
+
+def send_command(command, timeout_val=0.3):
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=timeout_val) as ser:
+            command += '\n'  # Ensure the command ends with a newline
+
+            # Flush input and output buffers
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+
+            # Send the shell command
+            ser.write(command.encode('utf-8'))
+            print(f"Sent command: {command.strip()}")
+
+            # Read and print response
+            print("Board output:")
+            start_time = time.time()
+            while time.time() - start_time < timeout_val:  # read for timeout seconds
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                line = filter_line(line, command)
+                if line:
+                    print(line)
+
     except serial.SerialException as e:
-        print(f"Error opening serial port {SERIAL_PORT}: {e}")
-        print("Check if the board is connected and the port is correct.")
-        return None, gesture
+        print(f"Serial error: {e}")
 
-    start_time = time.time()
-    
-    while time.time() - start_time < SAMPLE_DURATION:
-        try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                try:
-                    timestamp, ax, ay, az, gx, gy, gz = map(float, line.split(','))
-                    data.append([ax, ay, az, gx, gy, gz])
-                except ValueError:
-                    print(f"Invalid data format: {line}")
-                    continue
-        except UnicodeDecodeError as e:
-            print(f"UnicodeDecodeError: {e}. Skipping invalid byte sequence.")
-            continue
-    
-    ser.close()
-    
-    if len(data) < 10:  # Minimum number of samples
-        print(f"Insufficient data collected ({len(data)} samples). Check UART output.")
-        return None, gesture
-    
-    # Compute features
-    data = np.array(data)
-    ax, ay, az, gx, gy, gz = data[:, 0], data[:, 1], data[:, 2], data[:, 3], data[:, 4], data[:, 5]
-    try:
-        features = [
-            np.mean(ax), np.mean(ay), np.mean(az),
-            np.std(ax), np.std(ay), np.std(az),
-            np.mean(np.abs(ax) + np.abs(ay) + np.abs(az)),
-            np.corrcoef(ax, ay)[0, 1] if len(ax) > 1 else 0.0,
-            np.corrcoef(ax, az)[0, 1] if len(ax) > 1 else 0.0,
-            np.corrcoef(ay, az)[0, 1] if len(ay) > 1 else 0.0,
-            np.mean(gx), np.mean(gy), np.mean(gz),
-            np.std(gx), np.std(gy), np.std(gz),
-            np.mean(np.abs(gx) + np.abs(gy) + np.abs(gz)),
-            np.corrcoef(gx, gy)[0, 1] if len(gx) > 1 else 0.0,
-            np.corrcoef(gx, gz)[0, 1] if len(gx) > 1 else 0.0,
-            np.corrcoef(gy, gz)[0, 1] if len(gy) > 1 else 0.0
-        ]
-    except Exception as e:
-        print(f"Error computing features: {e}")
-        return None, gesture
-    
-    # Save raw data
-    with open(filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['timestamp', 'ax', 'ay', 'az', 'gx', 'gy', 'gz'])
-        for i, row in enumerate(data):
-            writer.writerow([start_time + i * 0.019] + list(row))
-    
-    print(f"Data saved to {filename}")
-    return features, gesture
+def terminal():
+    timeout_val = 0.3  # Default timeout value
+    print("Main has been called")
+    print(f"Using serial port: {SERIAL_PORT}")
+    while(True):
+        print("Ready to send commands. Type 'exit' to quit, or 'term_help' for help related to the python terminal interface.")
+        command = input("Enter command: ").strip()
+        if command.lower() == 'exit':
+            print("Exiting...")
+            break
+        elif command.lower() == 'term_help':
+            print("Python terminal commands:")
+            print("  - 'exit': Exit the terminal")
+            print("  - 'help': Get help related to the Discovery Board")
+            print("  - 'term_help': Get help related to the Python terminal interface")
+            print("  - 'set_timeout <seconds>': Set the timeout for serial commands (default is 0.3 seconds)")
+        elif command.lower().startswith('set_timeout '):
+            try:
+                timeout_val = float(command.split()[1])
+                print(f"Timeout set to {timeout_val} seconds")
+            except (IndexError, ValueError):
+                print("Invalid timeout value. Usage: set_timeout <seconds>")
+        elif command.lower() == 'clear':
+            os.system('clear')
+        else:
+            send_command(command, timeout_val=timeout_val)
 
-def train_model(data, labels):
-    """Train a Random Forest classifier."""
-    clf = RandomForestClassifier(n_estimators=20, max_depth=10, random_state=42)
-    clf.fit(data, labels)
-    return clf
-
-def export_model(clf):
-    """Export model to C code, ensuring C compatibility."""
-    c_code = port(clf, classmap={g: i for i, g in enumerate(GESTURES)}, platform='c')
-    # Replace <cstdarg> with <stdarg.h> in the generated code
-    c_code = c_code.replace('#include <cstdarg>', '#include <stdarg.h>')
-    with open('model.h', 'w') as f:
-        f.write(c_code)
-    with open('model.c', 'w') as f:
-        f.write('#include "model.h"\n' + c_code)
-    print("Model exported to model.h and model.c")
-
-def main():
-    # Collect data
-    all_features = []
-    all_labels = []
-    
-    for gesture in GESTURES:
-        for i in range(SAMPLES_PER_GESTURE):
-            input(f"Prepare to collect {gesture} sample {i+1}/{SAMPLES_PER_GESTURE}. Press Enter to start...")
-            features, label = collect_data(gesture)
-            if features is None:
-                print(f"Skipping {gesture} sample {i+1} due to collection error.")
-                continue
-            all_features.append(features)
-            all_labels.append(label)
-    
-    if not all_features:
-        print("No valid data collected. Exiting.")
-        return
-    
-    # Train model
-    clf = train_model(np.array(all_features), all_labels)
-    
-    # Evaluate model
-    from sklearn.metrics import accuracy_score
-    predictions = clf.predict(all_features)
-    print(f"Training accuracy: {accuracy_score(all_labels, predictions):.2f}")
-    
-    # Export model to C
-    export_model(clf)
-    
-    # Monitor inference results
-    print("Switch to inference mode by pressing the button on the board.")
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        while True:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                print(line)
-    except serial.SerialException as e:
-        print(f"Error opening serial port for inference: {e}")
 
 if __name__ == '__main__':
     try:
-        main()
+        terminal()
     except KeyboardInterrupt:
         print("Program terminated")
