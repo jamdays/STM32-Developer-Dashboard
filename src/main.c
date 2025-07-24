@@ -32,6 +32,8 @@
 
 #include <zephyr/drivers/i2c.h>
 
+#include <zephyr/net/dhcpv4_server.h>
+
 #include "wifi.h"
 #include "filesys.h"
 
@@ -492,6 +494,7 @@ void http_client_work_handler(struct k_work *work) {
     snprintf(_buf, sizeof(_buf), msg_template, path, host, len, buf);
     write(sock, _buf, strlen(_buf));
     close(sock);
+    freeaddrinfo(res);
 }
 
 void sensor_work_handler(struct k_work *work) {
@@ -569,6 +572,57 @@ void interrupt_http_work_handler(struct k_work *work) {
     //struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, interrupt_work);
     struct sensor_info *sensor = &sensors[LSM6DSL];
     printk("Interrupt http work handler for sensor %s\n", sensor->name);
+
+    char buf[128];           
+    struct http_request req;
+    //static uint8_t recv_buf[512];
+    int sock;
+    struct addrinfo *res;
+    struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
+        .ai_flags = AI_NUMERICHOST,
+    };
+    printk("http_client_work_handler for sensor at %p, name = %s, url = %s\n", sensor, sensor->name, sensor->url);
+    int ret = sensor_reading(sensor->name, buf, sizeof(buf));
+    if (ret < 0) {
+        printk("Sensor read failed: %d\n", ret);
+        return;
+    }
+
+    // Make sure the result is a full line
+    size_t len = strlen(buf);
+    if (len < sizeof(buf) - 1) {
+        buf[len] = '\0';
+    }
+    char _url[128];
+    strncpy(_url, sensor->interrupt_url, sizeof(_url) - 1);
+    _url[sizeof(_url) - 1] = '\0';
+
+    // Basic URL parsing
+    char *host = _url;
+    char *path = strchr(host, '/');
+    if (path) {
+        *path = 0;
+        path++;
+    } else {
+        path = "";
+    }
+
+    if (getaddrinfo(host, "80", &hints, &res) != 0) {
+        printk("Failed to resolve hostname: %s\n", host);
+        return;
+    }
+    
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    connect(sock, (struct sockaddr *)res->ai_addr, sizeof(res->ai_addr));
+    char _buf[256]; // Buffer for the HTTP request
+    char * msg_template = "POST /%s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\nTAP EVENT:\r\n%s";
+    snprintf(_buf, sizeof(_buf), msg_template, path, host, len, buf);
+    write(sock, _buf, strlen(_buf));
+    close(sock);
+    freeaddrinfo(res);
+
     
 }
 
@@ -755,10 +809,25 @@ static void cmd_lsm6dsl_tap_http_start(const struct shell *shell, size_t argc, c
         shell_error(shell, "Usage: lsm6dsl_tap_http_start <url>");
         return;
     }
-    sensors[LSM6DSL].interrupt_url = argv[1];
+    sensors[LSM6DSL].interrupt_url = strdup(argv[1]);
 
     enable_single_tap_sensor();
     lsm6dsl_mode = LSM6DSL_MODE_TAP;
+    lsm6dsl_action_mode = MODE_HTTP;
+
+    shell_print(shell, "Started LSM6DSL tap detection with HTTP mode");
+}
+
+static void cmd_lsm6dsl_step_http_start(const struct shell *shell, size_t argc, char **argv) {
+    if (argc < 2) {
+        shell_error(shell, "Usage: lsm6dsl_tap_http_start <url>");
+        return;
+    }
+
+    sensors[LSM6DSL].interrupt_url = strdup(argv[1]);
+
+    enable_step_sensor();
+    lsm6dsl_mode = LSM6DSL_MODE_STEP;
     lsm6dsl_action_mode = MODE_HTTP;
 
     shell_print(shell, "Started LSM6DSL tap detection with HTTP mode");
@@ -863,9 +932,10 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
         }
 
         /* Accel */
-        sensor_channel_get(lsm6dsl, SENSOR_CHAN_ACCEL_XYZ, val);
+        /*sensor_channel_get(lsm6dsl, SENSOR_CHAN_ACCEL_XYZ, val);
         used = snprintf(buf, buf_len,
-                        "LSM6DSL Accel: X %d.%06d, Y %d.%06d, Z %d.%06d m/s^2\n",
+                        //"LSM6DSL Accel: X %d.%06d, Y %d.%06d, Z %d.%06d m/s^2\n",
+                        "LSM6DSL Accel: X %d.%d, Y %d.%d, Z %d.%d m/s^2\n",
                         val[0].val1, val[0].val2,
                         val[1].val1, val[1].val2,
                         val[2].val1, val[2].val2);
@@ -877,7 +947,28 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
                              val[0].val1, val[0].val2,
                              val[1].val1, val[1].val2,
                              val[2].val1, val[2].val2);
-        }
+        }*/
+       static struct sensor_value accel_x, accel_y, accel_z;
+       static struct sensor_value gyro_x, gyro_y, gyro_z;
+       sensor_sample_fetch_chan(lsm6dsl, SENSOR_CHAN_ACCEL_XYZ);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_ACCEL_X, &accel_x);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_ACCEL_Y, &accel_y);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_ACCEL_Z, &accel_z);
+
+	/* lsm6dsl gyro */
+	    sensor_sample_fetch_chan(lsm6dsl, SENSOR_CHAN_GYRO_XYZ);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_GYRO_X, &gyro_x);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_GYRO_Y, &gyro_y);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_GYRO_Z, &gyro_z);
+
+       used = sprintf(buf, "accel x:%f,y:%f,z:%f\n gyro x:%f,y:%f,z:%f",
+							  sensor_value_to_float(&accel_x),
+							  sensor_value_to_float(&accel_y),
+							  sensor_value_to_float(&accel_z),
+                              sensor_value_to_float(&gyro_x),
+							   sensor_value_to_float(&gyro_y),
+							   sensor_value_to_float(&gyro_z));
+
     }
 
     else if (strcmp(sensor_name, "vl53l0x") == 0) {
@@ -985,6 +1076,92 @@ void init_sensors() {
         }
     }
 }
+
+#include <zephyr/net/wifi_mgmt.h>
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_config.h>
+#include <zephyr/net/net_ip.h>
+#include <zephyr/net/dhcpv4_server.h>
+#include <zephyr/shell/shell.h>
+#include <zephyr/logging/log.h>
+
+
+void self_assign_ip() {
+	int idx = 1;
+	struct in_addr addr = {0};
+	struct net_if *iface = net_if_get_default();
+    const char * ip_str = "192.168.1.1";
+	net_addr_pton(AF_INET, ip_str, &addr);
+
+	struct net_if_addr *ifaddr;
+	struct in_addr netmask;
+    const char * nmask_str = "255.255.255.0";
+
+	ifaddr = net_if_ipv4_addr_add(iface, &addr, NET_ADDR_MANUAL, 0);
+	net_addr_pton(AF_INET, nmask_str, &netmask);
+
+	net_if_ipv4_set_netmask_by_addr(iface, &addr, &netmask);
+	return;
+}
+
+
+static int cmd_wifi_ap(const struct shell *shell, size_t argc, char **argv)
+{
+    struct net_if *iface = net_if_get_default();
+    self_assign_ip();
+
+    // 1. Set up the AP parameters
+    struct wifi_connect_req_params ap_params = {
+        .ssid = "ADAM",
+        .ssid_length = strlen("ADAM"),
+        .psk = "ADAM1234",
+        .psk_length = strlen("ADAM1234"),
+        .channel = 6,
+        .security = WIFI_SECURITY_TYPE_PSK,
+        .band = WIFI_FREQ_BAND_2_4_GHZ,
+    };
+
+    // 2. Start the AP
+    int ret = net_mgmt(NET_REQUEST_WIFI_AP_ENABLE, iface, &ap_params, sizeof(ap_params));
+    if (ret) {
+        shell_error(shell, "Failed to start AP: %d", ret);
+        return ret;
+    }
+    shell_print(shell, "Wi-Fi AP started: SSID=%s, password=%s", ap_params.ssid, ap_params.psk);
+
+    // // 3. Assign static IP address
+    struct in_addr ipaddr, netmask, gw;
+
+    net_addr_pton(AF_INET, "192.168.1.1", &ipaddr); 
+    // ||
+    //     !net_addr_pton(AF_INET, "255.255.255.0", &netmask) ||
+    //     !net_addr_pton(AF_INET, "192.168.1.1", &gw)) {
+    //     shell_error(shell, "Failed to parse static IP settings");
+    //     return -EINVAL;
+    // }
+
+    // net_if_ipv4_addr_add(iface, &ipaddr, NET_ADDR_MANUAL, 0);
+    // net_if_ipv4_set_netmask(iface, &netmask);
+    // net_if_ipv4_set_gw(iface, &gw);
+
+    // shell_print(shell, "Static IP set: 192.168.1.1/24");
+
+    // 4. Start DHCP server
+    ret = net_dhcpv4_server_start(iface, &ipaddr);
+    if (ret) {
+        shell_error(shell, "Failed to start DHCP server: %d", ret);
+        return ret;
+    }
+    shell_print(shell, "DHCP server started");
+
+    return 0;
+}
+
+SHELL_CMD_REGISTER(wifi_ap, NULL,
+    "Start Wi-Fi AP with SSID=ADAM and password=ADAM1234",
+    cmd_wifi_ap);
+
+
 
 void main(void)
 {
