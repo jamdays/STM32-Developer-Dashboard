@@ -5,7 +5,7 @@ import { useEffect, useState, useRef } from "react";
 export default function Home() {
   const [command, setCommand] = useState(""); // Stores the current command input
   const [output, setOutput] = useState<string[]>([]); // Stores the terminal output
-  const flaskUrl = process.env.NEXT_PUBLIC_FLASK_URL || "http://localhost:5000"; // Flask API URL
+  const flaskUrl = process.env.NEXT_PUBLIC_FLASK_URL; // Flask API URL
 
   const outputRef = useRef<HTMLDivElement>(null); // Ref to track the output container
 

@@ -5,3 +5,4 @@
 .vscode/ipch
 .vscode/settings.json
 python_server/flaskr/__pycache__/*
+.env
