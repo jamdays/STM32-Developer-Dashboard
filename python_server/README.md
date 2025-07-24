@@ -1,7 +1,7 @@
-# Starting the Server
+## Starting the Server
 First make sure you're cd'd into the python_server folder
 then run `python3 run.py` in your terminal.
-# Example: Running a command
+## Example: Running a command
 ```console
 curl -X POST http://127.0.0.1:5000/process_command \
 -H "Content-Type: application/json" \
