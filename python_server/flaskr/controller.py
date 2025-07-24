@@ -1,3 +1,4 @@
+import subprocess
 import serial
 import csv
 import os
@@ -105,8 +106,11 @@ def process_command(command, timeout_val=0.3):
             return "Invalid timeout value. Usage: set_timeout <seconds>"
     elif command.lower().startswith('os_do '):
         try:
-            os.system(command[6:])  # Execute the command after 'os_do '
-            return f"Executed OS command: {command[6:]}"
+            result = subprocess.run(command[6:], shell=True, text=True, capture_output=True)
+            if result.returncode == 0:
+                return result.stdout.strip()  # Return the command's output
+            else:
+                return f"Error executing OS command: {result.stderr.strip()}"
         except Exception as e:
             return f"Error executing OS command: {e}"
     else:
