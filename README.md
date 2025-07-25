@@ -4,7 +4,7 @@ First, build and flash the developer dashboard onto your discovery board.
 Within VSCode (with the PlatformIO plugin installed), open the PlatformIO: Serial Monitor (it looks like a little plug icon on the bottom bar of the screen)
 
 Now, you can interact with the UART shell! Try out some of the following commands:
-`help`, `read lsm6dsll`
+`help`, `read lsm6dsl`
 `read lis3mdl`
 `read hts221`
 `read lps22hb`
