@@ -1005,6 +1005,7 @@ void main(void)
     if (rc < 0) {
         printk("Failed to mount littlefs: %d\n", rc);
     }
+    init_dir();
     printk("Filesystem initialized\n");
     
     // Initialize WiFi
