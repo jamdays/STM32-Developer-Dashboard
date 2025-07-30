@@ -1,5 +1,6 @@
 #include "wifi.h"
 #include <zephyr/net/wifi_mgmt.h>
+
 #include <zephyr/fs/fs.h>
 #include <zephyr/fs/littlefs.h>
 #include <zephyr/storage/flash_map.h>
@@ -148,6 +149,7 @@ void wifi_connect_to_saved_network() {
         printk("No saved WiFi credentials found.\n");
     }
 }
+
 
 SHELL_CMD_REGISTER(wifi_connect, NULL, "Connect to WiFi", cmd_wifi_connect);
 SHELL_CMD_REGISTER(wifi_save, NULL, "Save WiFi credentials to file", cmd_wifi_save);

@@ -61,8 +61,10 @@ static int cmd_cat(const struct shell *shell, size_t argc, char **argv)
     fs_file_t_init(&file);
     int rc;
     char * filepath = argv[1];
+    char full_path[64];
+    snprintf(full_path, sizeof(full_path), "/lfs/%s", filepath);
 
-    rc = fs_open(&file, filepath, FS_O_READ);
+    rc = fs_open(&file, full_path, FS_O_READ);
     if (rc == -ENOENT) {
         shell_print(shell, "File doesn't exist: %s", filepath);
         return 0;
@@ -95,7 +97,10 @@ void cmd_rm(const struct shell *shell, size_t argc, char **argv) {
         shell_error(shell, "Usage: rm <file_name>");
         return;
     }
-    const char *file_name = argv[1];
+    //const char *file_name = argv[1];
+    char * filepath = argv[1];
+    char file_name[64];
+    snprintf(file_name, sizeof(file_name), "/lfs/%s", filepath);
     int rc = fs_unlink(file_name);
     if (rc < 0) {
         shell_error(shell, "Failed to remove file %s: %d", file_name, rc);
