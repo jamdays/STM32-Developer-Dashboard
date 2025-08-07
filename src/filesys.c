@@ -99,8 +99,11 @@ void cmd_rm(const struct shell *shell, size_t argc, char **argv) {
     }
     //const char *file_name = argv[1];
     char * filepath = argv[1];
-    char file_name[64];
-    snprintf(file_name, sizeof(file_name), "/lfs/%s", filepath);
+    char file_name[256];
+    if (strcmp(current_dir, "/") == 0)
+        snprintf(file_name, sizeof(file_name), "/%s", filepath);
+    else
+        snprintf(file_name, sizeof(file_name), "%s/%s", current_dir, filepath);
     int rc = fs_unlink(file_name);
     if (rc < 0) {
         shell_error(shell, "Failed to remove file %s: %d", file_name, rc);
@@ -199,8 +202,8 @@ void cmd_cd(const struct shell *shell, size_t argc, char **argv){
 
 
 SHELL_CMD_REGISTER(cd, NULL, "Change directory", cmd_cd);
-SHELL_CMD_REGISTER(pwd, NULL, "Change directory", cmd_pwd);
+SHELL_CMD_REGISTER(pwd, NULL, "present working directory", cmd_pwd);
 SHELL_CMD_REGISTER(mkdir, NULL, "Create directory", cmd_mkdir);
-SHELL_CMD_REGISTER(ls, NULL, "List items on FS", cmd_ls);
+SHELL_CMD_REGISTER(ls, NULL, "List items in directory", cmd_ls);
 SHELL_CMD_REGISTER(cat, NULL, "Display contents of a file", cmd_cat);
 SHELL_CMD_REGISTER(rm, NULL, "Remove a file", cmd_rm);
