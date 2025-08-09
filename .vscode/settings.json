@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "*.bak": "c",
+        "*.july2night": "c",
+        "cstdio": "c"
+    },
+    "C_Cpp.errorSquiggles": "enabled"
+}
