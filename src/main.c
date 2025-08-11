@@ -883,7 +883,7 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
         sensor_channel_get(lps22hb, SENSOR_CHAN_PRESS, &val[0]);
 
         used = snprintf(buf, buf_len,
-                        "{\"pressure\": %d}",
+                        "{\"pressure\": %f}",
                         sensor_value_to_float(&val[0]));
     }
 
@@ -929,8 +929,8 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
         sensor_channel_get(vl53l0x, SENSOR_CHAN_DISTANCE, &val[0]);
 
         used = snprintf(buf, buf_len,
-                        "{\"distance\": %d}",
-                        (val[0].val2 - sensors[VL53L0X].cal_x));
+                        "{\"distance\": %f}",
+                        (sensor_value_to_milli(&val[0]) - sensors[VL53L0X].cal_x));
     }
 
     else if (strcmp(sensor_name, "button0") == 0) {
@@ -1022,7 +1022,7 @@ static int cmd_calibrate_sensor(const struct shell *shell, size_t argc, char **a
 
     } else if (strcmp(sensor_name, "vl53l0x") == 0) {
         sensor_channel_get(vl53l0x, SENSOR_CHAN_DISTANCE, &val[0]);
-        sensors[sensor_index].cal_x = val[0].val2;
+        sensors[sensor_index].cal_x = sensor_value_to_milli(&val[0]);
         shell_print(shell, "VL53L0X calibrated successfully");
     } else {
         shell_error(shell, "Unsupported sensor for calibration: %s", sensor_name);
