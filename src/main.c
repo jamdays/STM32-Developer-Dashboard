@@ -1,5 +1,22 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <errno.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/services/nus.h>
+#include <zephyr/bluetooth/services/nus/inst.h>
+
+#include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/i2c.h>
+
+#include <zephyr/fs/fs.h>
+#include <zephyr/fs/littlefs.h>
 
 #include <zephyr/logging/log.h>
 
@@ -7,31 +24,19 @@
 #include <zephyr/net/net_ip.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/http/client.h>
-
-#include <zephyr/shell/shell.h>
-
-#include <zephyr/device.h>
-#include <zephyr/devicetree.h>
-
-#include <zephyr/drivers/sensor.h>
-#include <zephyr/drivers/gpio.h>
-
-#include <zephyr/fs/fs.h>
-#include <zephyr/fs/littlefs.h>
-#include <zephyr/storage/flash_map.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <errno.h>
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_config.h>
 
 #include <zephyr/posix/fcntl.h>
 #include <zephyr/posix/sys/select.h>
-#include <zephyr/net/socket.h>
-#include <zephyr/kernel.h>
 
-#include <zephyr/drivers/i2c.h>
+#include <zephyr/shell/shell.h>
+#include <zephyr/shell/shell_backend.h>
 
+#include <zephyr/storage/flash_map.h>
+
+// Doesn't work
+//#include <zephyr/net/dhcpv4_server.h>
 //#include <zephyr/net/dhcpv4_server.h>
 
 #include "wifi.h"
@@ -99,8 +104,6 @@ enum {
     INTERRUPTS_ENABLE = 0x80   // Bit 7 set
 };
 
-
-
 // FUNC_SRC1 - 0x53
 enum {
     SENSORHUB_END_OP = 0x01,  // Bit 0 set
@@ -112,7 +115,7 @@ enum {
     BIT_7 = 0x40,  // Bit 6 set
     BIT_8 = 0x80   // Bit 7 set
 };
-
+// Sensor info
 enum sensor_names {
     HTS221,
     LPS22HB,
@@ -124,8 +127,10 @@ enum sensor_names {
 
 const struct device *i2c_dev = DEVICE_DT_GET(I2C_NODE);
 
+// LSM6DSL interrupts and actions
 volatile int lsm6dsl_mode = 0; // 0 - normal, 1 - step, 2 - tap
 volatile int lsm6dsl_action_mode = 0; // 0 - normal, 1 - step, 2 - tap
+
 enum {
     LSM6DSL_MODE_NORMAL = 0,
     LSM6DSL_MODE_STEP = 1,
@@ -155,7 +160,6 @@ static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static struct gpio_callback button_cb_data;
-
 
 // Filesystem
 FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(cstorage);
@@ -202,7 +206,6 @@ struct axes_list {
 };
 
 struct sensor_info {
-
     bool dev_or_gpio;
     const struct device *dev;
     const struct gpio_dt_spec *gpio;
@@ -221,6 +224,12 @@ struct sensor_info {
     struct k_work interrupt_http_work; // For interrupt HTTP client
     const char * url; // For timer HTTP client
     const char * interrupt_url; // For interrupt HTTP client
+    float cal_x;
+    float cal_y;
+    float cal_z;
+    float cal_gyro_x;
+    float cal_gyro_y;
+    float cal_gyro_z;
 };
 
 struct sensor_save_work {
@@ -314,8 +323,9 @@ struct sensor_info sensors[NUM_SENSORS] = {
         .name = "vl53l0x",
         .timer_callback = sensor_timer_callback,
         .http_timer_callback = sensor_timer_http_callback,
-        .cb_filename = NULL
-
+        .cb_filename = NULL,
+        .num_axes = 1,
+        .axes = vl53l0x_axes
     },
     {
         .dev_or_gpio = TYPE_GPIO,
@@ -341,6 +351,7 @@ static void http_client_work_handler(struct k_work *work);
 
 void int1_handler(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
     //printk("INT1 triggered (step or free fall)\n");
+    // TODO we could check the source of the interrupt instead of keeping state...
     switch (lsm6dsl_mode) {
         case LSM6DSL_MODE_STEP:
             switch (lsm6dsl_action_mode) {
@@ -403,7 +414,8 @@ static void cmd_toggle_led1 (const struct shell *shell, size_t argc, char **argv
         shell_print(shell, "LED0 turned ON");
     }
 }
-#include <zephyr/posix/fcntl.h>
+
+
 // Work Handlers
 void http_client_work_handler(struct k_work *work) {
     struct sensor_info *sensor = CONTAINER_OF(work, struct sensor_info, http_work);
@@ -424,6 +436,7 @@ void http_client_work_handler(struct k_work *work) {
     }
 
     // Make sure the result is a full line
+    // TODO fix BoF
     size_t len = strlen(buf);
     if (len < sizeof(buf) - 1) {
         buf[len] = '\0';
@@ -469,8 +482,14 @@ void sensor_work_handler(struct k_work *work) {
     }
 
     size_t len = strlen(buf);
-    if (len < sizeof(buf) - 1) {
+
+    if (len < sizeof(buf) - 2) {
+        buf[len] = '\n';
+        buf[len+1] = '\0';
+    } else if (len < sizeof(buf) - 1) {
         buf[len] = '\0';
+    } else {
+        buf[sizeof(buf) - 1] = '\0';
     }
 
     snprintf(full_path, sizeof(full_path), "/lfs/%s", sensor->cb_filename);
@@ -502,7 +521,7 @@ void interrupt_work_handler(struct k_work *work) {
         printk("Failed to open file %s: %d\n", full_path, ret);
         return;
     }
-    // Write the interrupt data to the file
+    
     char buf[128];
     ret = sensor_reading(sensor->name, buf, sizeof(buf));
     if (ret < 0) {
@@ -510,7 +529,7 @@ void interrupt_work_handler(struct k_work *work) {
         fs_close(&file);
         return;
     }
-    // Make sure the result is a full line
+    
     size_t len = strlen(buf);
     if (len < sizeof(buf) - 1) {
         buf[len] = '\0';
@@ -552,7 +571,6 @@ void interrupt_http_work_handler(struct k_work *work) {
     strncpy(_url, sensor->interrupt_url, sizeof(_url) - 1);
     _url[sizeof(_url) - 1] = '\0';
 
-    // Basic URL parsing
     char *host = _url;
     char *path = strchr(host, '/');
     if (path) {
@@ -746,6 +764,7 @@ static void cmd_lsm6dsl_tap_http_start(const struct shell *shell, size_t argc, c
     shell_print(shell, "Started LSM6DSL tap detection with HTTP mode");
 }
 
+// TODO these stop fns would be better if we add to driver so we can reset the registers
 static void cmd_lsm6dsl_tap_http_stop(const struct shell *shell, size_t argc, char **argv) {
 
     sensors[LSM6DSL].interrupt_url = NULL;
@@ -805,6 +824,16 @@ static void cmd_lsm6dsl_step_start(const struct shell *shell, size_t argc, char 
 static void cmd_lsm6dsl_step_stop(const struct shell *shell, size_t argc, char **argv) {
     // Stop the LSM6DSL step detection timer
     //k_timer_stop(&sensors[LSM6DSL].timer);
+    lsm6dsl_mode = 3; // Disable step detection
+
+    shell_print(shell, "Stopped LSM6DSL step detection");
+}
+
+static void cmd_lsm6dsl_tap_stop(const struct shell *shell, size_t argc, char **argv) {
+    // Stop the LSM6DSL step detection timer
+    //k_timer_stop(&sensors[LSM6DSL].timer);
+    lsm6dsl_mode = 3; // Disable step detection
+    
     shell_print(shell, "Stopped LSM6DSL step detection");
 }
 
@@ -824,6 +853,7 @@ static void cmd_sensor_timer_stop (const struct shell *shell, size_t argc, char 
 
 // Sensor Reading (Returns formatted string of sensor data)
 // TODO we should use the sensors struct instead of hardcoding
+// TODO would be better to do this all async in a seperate thread
 int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
 {
     struct sensor_value val[3];
@@ -862,7 +892,8 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
             return rc;
         }
         sensor_channel_get(lis3mdl, SENSOR_CHAN_MAGN_XYZ, val);
-        used = snprintf(buf, buf_len, "{\"mag\": [%.3f, %.3f, %.3f]}", sensor_value_to_float(&val[0]), sensor_value_to_float(&val[1]), sensor_value_to_float(&val[2]));
+        used = snprintf(buf, buf_len, "{\"mag\": [%.3f, %.3f, %.3f]}", (sensor_value_to_float(&val[0]) - sensors[LIS3MDL].cal_x), (sensor_value_to_float(&val[1]) - sensors[LIS3MDL].cal_y), (sensor_value_to_float(&val[2]) - sensors[LIS3MDL].cal_z));
+    
     }
 
     else if (strcmp(sensor_name, "lsm6dsl") == 0) {
@@ -883,12 +914,12 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
 	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_GYRO_Z, &gyro_z);
 
         used = sprintf(buf, "{\"accel\": [%.3f, %.3f, %.3f], \"gyro\": [%.3f, %.3f, %.3f]}",
-        sensor_value_to_float(&accel_x),
-							  sensor_value_to_float(&accel_y),
-							  sensor_value_to_float(&accel_z),
-                              sensor_value_to_float(&gyro_x),
-							   sensor_value_to_float(&gyro_y),
-							   sensor_value_to_float(&gyro_z));
+        (sensor_value_to_float(&accel_x) - sensors[LSM6DSL].cal_x),
+        (sensor_value_to_float(&accel_y) - sensors[LSM6DSL].cal_y),
+        (sensor_value_to_float(&accel_z) - sensors[LSM6DSL].cal_z),
+        (sensor_value_to_float(&gyro_x) - sensors[LSM6DSL].cal_gyro_x),
+        (sensor_value_to_float(&gyro_y) - sensors[LSM6DSL].cal_gyro_y),
+        (sensor_value_to_float(&gyro_z) - sensors[LSM6DSL].cal_gyro_z));   
     }
 
     else if (strcmp(sensor_name, "vl53l0x") == 0) {
@@ -899,7 +930,7 @@ int sensor_reading(const char *sensor_name, char *buf, size_t buf_len)
 
         used = snprintf(buf, buf_len,
                         "{\"distance\": %d}",
-                        val[0].val2);
+                        (val[0].val2 - sensors[VL53L0X].cal_x));
     }
 
     else if (strcmp(sensor_name, "button0") == 0) {
@@ -946,7 +977,95 @@ static int cmd_read_sensor(const struct shell *shell, size_t argc, char **argv)
     return 0;
 }
 
+static int cmd_calibrate_sensor(const struct shell *shell, size_t argc, char **argv) {
+    struct sensor_value val[3];
+    int rc;
+
+    if (argc < 2) {
+        shell_error(shell, "Usage: calibrate <sensor_name>");
+        return -EINVAL;
+    }
+    const char *sensor_name = argv[1];
+    int sensor_index = get_sensor_index(sensor_name);
+    if (strcmp (sensor_name, "lsm6dsl") == 0) {
+        if ((rc = sensor_sample_fetch(lsm6dsl)) != 0) {
+            return rc;
+        }
+        static struct sensor_value accel_x, accel_y, accel_z;
+        static struct sensor_value gyro_x, gyro_y, gyro_z;
+        sensor_sample_fetch_chan(lsm6dsl, SENSOR_CHAN_ACCEL_XYZ);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_ACCEL_X, &accel_x);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_ACCEL_Y, &accel_y);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_ACCEL_Z, &accel_z);
+
+	    sensor_sample_fetch_chan(lsm6dsl, SENSOR_CHAN_GYRO_XYZ);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_GYRO_X, &gyro_x);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_GYRO_Y, &gyro_y);
+	    sensor_channel_get(lsm6dsl, SENSOR_CHAN_GYRO_Z, &gyro_z);
+
+        //used = sprintf(buf, "{\"accel\": [%.3f, %.3f, %.3f], \"gyro\": [%.3f, %.3f, %.3f]}",
+        
+        sensors[sensor_index].cal_x = sensor_value_to_float(&accel_x);
+        sensors[sensor_index].cal_y = sensor_value_to_float(&accel_y);
+        sensors[sensor_index].cal_z = sensor_value_to_float(&accel_z);
+        sensors[sensor_index].cal_gyro_x = sensor_value_to_float(&gyro_x);
+        sensors[sensor_index].cal_gyro_y = sensor_value_to_float(&gyro_y);
+        sensors[sensor_index].cal_gyro_z = sensor_value_to_float(&gyro_z);
+
+        shell_print(shell, "LSM6DSL calibrated successfully");
+    } else if (strcmp(sensor_name, "lis3mdl") == 0) {
+        sensor_channel_get(lis3mdl, SENSOR_CHAN_MAGN_XYZ, val);
+        sensors[sensor_index].cal_x = sensor_value_to_float(&val[0]);
+        sensors[sensor_index].cal_y = sensor_value_to_float(&val[1]);
+        sensors[sensor_index].cal_z = sensor_value_to_float(&val[2]);
+        shell_print(shell, "LIS3MDL calibrated successfully");
+
+    } else if (strcmp(sensor_name, "vl53l0x") == 0) {
+        sensor_channel_get(vl53l0x, SENSOR_CHAN_DISTANCE, &val[0]);
+        sensors[sensor_index].cal_x = val[0].val2;
+        shell_print(shell, "VL53L0X calibrated successfully");
+    } else {
+        shell_error(shell, "Unsupported sensor for calibration: %s", sensor_name);
+        return -ENOTSUP;
+    }
+}
+
+static int cmd_uncalibrate_sensor(const struct shell *shell, size_t argc, char **argv) {
+   
+    if (argc < 2) {
+        shell_error(shell, "Usage: calibrate <sensor_name>");
+        return -EINVAL;
+    }
+    const char *sensor_name = argv[1];
+    int sensor_index = get_sensor_index(sensor_name);
+    if (strcmp (sensor_name, "lsm6dsl") == 0) {
+        
+        sensors[sensor_index].cal_x = 0;
+        sensors[sensor_index].cal_y = 0;
+        sensors[sensor_index].cal_z = 0;
+        sensors[sensor_index].cal_gyro_x = 0;
+        sensors[sensor_index].cal_gyro_y = 0;
+        sensors[sensor_index].cal_gyro_z = 0;
+
+        shell_print(shell, "LSM6DSL uncalibrated successfully");
+    } else if (strcmp(sensor_name, "lis3mdl") == 0) {
+        sensors[sensor_index].cal_x = 0;
+        sensors[sensor_index].cal_y = 0;
+        sensors[sensor_index].cal_z = 0;
+        shell_print(shell, "LIS3MDL uncalibrated successfully");
+
+    } else if (strcmp(sensor_name, "vl53l0x") == 0) {
+        sensors[sensor_index].cal_x = 0;
+        shell_print(shell, "VL53L0X uncalibrated successfully");
+    } else {
+        shell_error(shell, "Unsupported sensor for calibration: %s", sensor_name);
+        return -ENOTSUP;
+    }
+}
+
 SHELL_CMD_REGISTER(read, NULL, "Read sensor data", cmd_read_sensor);
+SHELL_CMD_REGISTER(calibrate, NULL, "Calibrate sensor", cmd_calibrate_sensor);
+SHELL_CMD_REGISTER(uncalibrate, NULL, "Uncalibrate sensor", cmd_uncalibrate_sensor);
 SHELL_CMD_REGISTER(toggle_led1, NULL, "Toggle LED1", cmd_toggle_led1);
 
 SHELL_CMD_REGISTER(sensor_timer_start, NULL, "Start sensor timer", cmd_sensor_timer_start);
@@ -959,11 +1078,11 @@ SHELL_CMD_REGISTER(lsm6dsl_step_start, NULL, "Start LSM6DSL event handler", cmd_
 SHELL_CMD_REGISTER(lsm6dsl_tap_start, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_tap_start);
 SHELL_CMD_REGISTER(lsm6dsl_tap_http_start, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_tap_http_start);
 SHELL_CMD_REGISTER(lsm6dsl_step_http_start, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_step_http_start);
-
 SHELL_CMD_REGISTER(lsm6dsl_step_http_stop, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_step_http_stop);
 SHELL_CMD_REGISTER(lsm6dsl_tap_http_stop, NULL, "Start LSM6DSL event handler", cmd_lsm6dsl_tap_http_stop);
 
 SHELL_CMD_REGISTER(lsm6dsl_step_stop, NULL, "Stop LSM6DSL event handler", cmd_lsm6dsl_step_stop);
+SHELL_CMD_REGISTER(lsm6dsl_tap_stop, NULL, "Stop LSM6DSL event handler", cmd_lsm6dsl_tap_stop);
 
 void init_sensors() {
     for (int i = 0; i < NUM_SENSORS; i++) {
@@ -981,6 +1100,13 @@ void init_sensors() {
             }
         }
 
+        sensors[i].cal_x = 0;
+        sensors[i].cal_y = 0;
+        sensors[i].cal_z = 0;
+        sensors[i].cal_gyro_x = 0;
+        sensors[i].cal_gyro_y = 0;
+        sensors[i].cal_gyro_z = 0;
+        
         sensors[i].timer_callback = sensor_timer_callback;
         k_timer_init(&sensors[i].timer, sensors[i].timer_callback, NULL);
         k_work_init(&sensors[i].work, sensor_work_handler);
@@ -1002,13 +1128,7 @@ void init_sensors() {
     }
 }
 
-#include <zephyr/net/wifi_mgmt.h>
-#include <zephyr/net/net_if.h>
-#include <zephyr/net/net_config.h>
-#include <zephyr/net/net_ip.h>
-//#include <zephyr/net/dhcpv4_server.h>
-#include <zephyr/shell/shell.h>
-#include <zephyr/logging/log.h>
+
 
 void self_assign_ip() {
 	int idx = 1;
@@ -1053,7 +1173,8 @@ static int cmd_wifi_ap(const struct shell *shell, size_t argc, char **argv)
 
     struct in_addr ipaddr, netmask, gw;
     
-    net_addr_pton(AF_INET, "192.168.1.3", &ipaddr); 
+    net_addr_pton(AF_INET, "192.168.1.3", &ipaddr);
+    // TODO This always fails. zephyr bug in eswifi driver from what I can tell...
     ret = net_dhcpv4_server_start(iface, &ipaddr);
     
     if (ret) {
@@ -1070,17 +1191,13 @@ SHELL_CMD_REGISTER(wifi_ap, NULL,
     cmd_wifi_ap);
 
 // BLUETOOTH NUS FEATURE
-#include <zephyr/kernel.h>
-#include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/services/nus.h>
-#include <zephyr/bluetooth/services/nus/inst.h>
+
 
 #define DEVICE_NAME		"ADAM_BT_TEST"
 #define DEVICE_NAME_LEN		(sizeof(DEVICE_NAME) - 1)
 
 K_THREAD_STACK_DEFINE(bt_work_stack, 1024);
 static struct k_work_q bt_work_q;
-
 static struct k_work shell_work;
 static char cmd_buf[128]; 
 
@@ -1113,7 +1230,7 @@ void received(struct bt_conn *conn, const void *data, uint16_t len, void *ctx)
     k_work_submit(&shell_work);
 }
 
-#include <zephyr/shell/shell_backend.h>
+
 void shell_work_handler(struct k_work *work)
 {
     const struct shell *_shell = shell_backend_get(0);
@@ -1125,8 +1242,8 @@ struct bt_nus_cb nus_listener = {
 	.received = received,
 };
 
-void _fini(void) __attribute__((weak));
-void _fini(void) {}
+//void _fini(void) __attribute__((weak));
+//void _fini(void) {}
 
 
 int main(void)
@@ -1159,6 +1276,7 @@ int main(void)
 
     // Initialize Sensors and Triggers
     init_sensors();
+    init_dir();
 
     // INTERRUPTS
     int ret = gpio_pin_configure_dt(&int1_gpio, GPIO_INPUT | GPIO_INT_EDGE_RISING);
@@ -1182,10 +1300,6 @@ int main(void)
     printk("INT1 interrupt configured on GPIOD pin %d\n", int1_gpio.pin);
     // INTERRUPTS
 
-    printk("System Initialized. Entering main loop.\n");
-
-
-
     //BT STUFF
     bt_nus_cb_register(&nus_listener, NULL);
     bt_enable(NULL);
@@ -1200,7 +1314,7 @@ int main(void)
                        30, NULL);
     k_work_queue_start(&bt_work_q, bt_work_stack, K_THREAD_STACK_SIZEOF(bt_work_stack), 5, NULL);
 
-
+    printk("System Initialized. Entering main loop.\n");
     while (1) {
         // TODO SLEEP HARDER
         gpio_pin_toggle_dt(&led0);

@@ -2,7 +2,8 @@
     "files.associations": {
         "*.bak": "c",
         "*.july2night": "c",
-        "cstdio": "c"
+        "cstdio": "c",
+        "shell.h": "c"
     },
     "C_Cpp.errorSquiggles": "enabled"
 }
