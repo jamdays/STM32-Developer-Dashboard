@@ -128,8 +128,8 @@ enum sensor_names {
 const struct device *i2c_dev = DEVICE_DT_GET(I2C_NODE);
 
 // LSM6DSL interrupts and actions
-volatile int lsm6dsl_mode = 0; // 0 - normal, 1 - step, 2 - tap
-volatile int lsm6dsl_action_mode = 0; // 0 - normal, 1 - step, 2 - tap
+volatile int lsm6dsl_mode = 0;
+volatile int lsm6dsl_action_mode = 0;
 
 enum {
     LSM6DSL_MODE_NORMAL = 0,
@@ -180,10 +180,6 @@ int32_t lsm6dsl_write_reg(uint8_t reg, const uint8_t *data, uint16_t len) {
     return i2c_burst_write(i2c_dev, I2C_ADDR, reg, data, len);    
 }
 
-static void platform_delay(uint32_t ms) {
-    k_msleep(ms);
-}
-
 static const struct gpio_dt_spec int1_gpio = {
     .port = DEVICE_DT_GET(DT_NODELABEL(gpiod)),
     .pin = INT1_PIN,
@@ -231,13 +227,7 @@ struct sensor_info {
     float cal_gyro_y;
     float cal_gyro_z;
 };
-
-struct sensor_save_work {
-    struct k_work work;
-    char sensor_name[32]; // Sensor name
-    char file_name[64]; // File name to save data
-};
-
+/*
 static struct axes_list hts221_axes[] = {
     { .chan = SENSOR_CHAN_AMBIENT_TEMP, .name = "temperature" },
     { .chan = SENSOR_CHAN_HUMIDITY, .name = "humidity" }
@@ -265,6 +255,7 @@ static struct axes_list lsm6dsl_axes[] = {
 static struct axes_list vl53l0x_axes[] = {
     { .chan = SENSOR_CHAN_PROX, .name = "proximity" }
 };
+*/
 
 void sensor_timer_callback(struct k_timer *timer_id);
 
@@ -280,8 +271,7 @@ struct sensor_info sensors[NUM_SENSORS] = {
         .timer_callback = sensor_timer_callback,
         .http_timer_callback = sensor_timer_http_callback,
         .cb_filename = NULL,
-        .num_axes = 2,
-        .axes = hts221_axes
+        .num_axes = 2
     },
     {
         .dev_or_gpio = TYPE_DEV,
@@ -291,8 +281,7 @@ struct sensor_info sensors[NUM_SENSORS] = {
         .timer_callback = sensor_timer_callback,
         .http_timer_callback = sensor_timer_http_callback,
         .cb_filename = NULL,
-        .num_axes = 1,
-        .axes = lps22hb_axes
+        .num_axes = 1
     },
     {
         .dev_or_gpio = TYPE_DEV,
@@ -302,8 +291,7 @@ struct sensor_info sensors[NUM_SENSORS] = {
         .timer_callback = sensor_timer_callback,
         .http_timer_callback = sensor_timer_http_callback,
         .cb_filename = NULL,
-        .num_axes = 3,
-        .axes = lis3mdl_axes
+        .num_axes = 3
     },
     {
         .dev_or_gpio = TYPE_DEV,
@@ -313,8 +301,7 @@ struct sensor_info sensors[NUM_SENSORS] = {
         .timer_callback = sensor_timer_callback,
         .http_timer_callback = sensor_timer_http_callback,
         .cb_filename = NULL,
-        .num_axes = 6,
-        .axes = lsm6dsl_axes
+        .num_axes = 6
     },
     {
         .dev_or_gpio = TYPE_DEV,
@@ -324,8 +311,7 @@ struct sensor_info sensors[NUM_SENSORS] = {
         .timer_callback = sensor_timer_callback,
         .http_timer_callback = sensor_timer_http_callback,
         .cb_filename = NULL,
-        .num_axes = 1,
-        .axes = vl53l0x_axes
+        .num_axes = 1
     },
     {
         .dev_or_gpio = TYPE_GPIO,
@@ -824,7 +810,7 @@ static void cmd_lsm6dsl_step_start(const struct shell *shell, size_t argc, char 
 static void cmd_lsm6dsl_step_stop(const struct shell *shell, size_t argc, char **argv) {
     // Stop the LSM6DSL step detection timer
     //k_timer_stop(&sensors[LSM6DSL].timer);
-    lsm6dsl_mode = 3; // Disable step detection
+    lsm6dsl_mode = 3; 
 
     shell_print(shell, "Stopped LSM6DSL step detection");
 }
@@ -832,7 +818,7 @@ static void cmd_lsm6dsl_step_stop(const struct shell *shell, size_t argc, char *
 static void cmd_lsm6dsl_tap_stop(const struct shell *shell, size_t argc, char **argv) {
     // Stop the LSM6DSL step detection timer
     //k_timer_stop(&sensors[LSM6DSL].timer);
-    lsm6dsl_mode = 3; // Disable step detection
+    lsm6dsl_mode = 3; 
     
     shell_print(shell, "Stopped LSM6DSL step detection");
 }
