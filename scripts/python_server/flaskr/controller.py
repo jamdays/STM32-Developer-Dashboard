@@ -1,7 +1,5 @@
 import subprocess
 import serial
-import serial.tools.list_ports # For Windows and cross-platform listing
-import platform
 import csv
 import os
 import sys
@@ -29,58 +27,13 @@ def get_opening():
 
 # Configuration
 def find_serial_port():
-    if platform.system() == "Windows":
-        # Windows-specific serial port detection
-        ports = list(serial.tools.list_ports.comports())
-        
-        likely_microcontroller_ports = [
-            p for p in ports if (
-                "USB Serial Device" in str(p.description) or
-                "Arduino" in str(p.description) or
-                "CP210x" in str(p.description) or
-                "CH340" in str(p.description) or
-                "FT232R" in str(p.description) or
-                "VID:PID" in str(p.hwid)
-            )
-        ]
-
-        if not likely_microcontroller_ports:
-            print("No serial ports found. Ensure the board is connected.")
-            sys.exit()
-        elif len(likely_microcontroller_ports) > 1:
-            print(f"Multiple potential serial ports found: {[p.device for p in likely_microcontroller_ports]}. The first one has been selected.")
-        
-        return likely_microcontroller_ports[0].device
-        
-    elif platform.system() in ["Linux", "Darwin"]: # Darwin is macOS
-        # Unix-like (macOS/Linux) serial port detection
-        # Common patterns for microcontrollers on these systems
-        patterns = [
-            '/dev/ttyUSB*',   # Linux (e.g., ESP32, Arduino using CP210x/CH340)
-            '/dev/ttyACM*',   # Linux (e.g., Arduino Uno/Mega using native USB)
-            '/dev/cu.usbmodem*', # macOS (common for Arduino, ESP32 Dev Boards)
-            '/dev/tty.usbmodem*', # macOS (alternative for some USB modems)
-        ]
-        
-        found_ports = []
-        for pattern in patterns:
-            found_ports.extend(glob.glob(pattern))
-        
-        # Remove duplicates
-        found_ports = sorted(list(set(found_ports)))
-
-        if not found_ports:
-            print("No serial ports found. Ensure the board is connected.")
-            sys.exit()
-        elif len(found_ports) > 1:
-            print(f"Multiple serial ports found: {found_ports}. The first one has been selected.")
-        
-        return found_ports[0]
-    else:
-        print(f"Unsupported operating system: {platform.system()}")
+    ports = glob.glob('/dev/cu.usbmodem*')
+    if not ports:
+        print("No serial ports found. Ensure the board is connected.")
         sys.exit()
-
-
+    elif len(ports) > 1:
+        print(f"Multiple serial ports have been found. The first one has been selected.")
+    return ports[0]
 
 # SERIAL_PORT = '/dev/cu.usbmodem103'  # Adjust for your macOS port (e.g., /dev/cu.usbmodemXXXX)
 SERIAL_PORT = find_serial_port()
